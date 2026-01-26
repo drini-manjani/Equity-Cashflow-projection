@@ -1,0 +1,38 @@
+SELECT
+    FundID,
+
+    -- % text like: '25 % of Repaid amount'  -> 0.25
+    TRY_CONVERT(decimal(9,6),
+        NULLIF(
+            LTRIM(RTRIM(
+                LEFT([Recallable amount limited to],
+                     NULLIF(CHARINDEX('%', [Recallable amount limited to]), 0) - 1
+                )
+            )),
+            ''
+        )
+    ) / 100.0 AS Recallable_Percentage_Decimal,
+
+    -- text like: '2 Years' -> 8
+    CASE
+        WHEN TRY_CONVERT(int,
+              NULLIF(
+                LTRIM(RTRIM(
+                    LEFT([Expiration after],
+                         NULLIF(CHARINDEX(' ', [Expiration after] + ' '), 0) - 1
+                    )
+                )),
+                ''
+              )
+            ) IS NULL
+        THEN NULL
+        ELSE TRY_CONVERT(int,
+              LTRIM(RTRIM(
+                LEFT([Expiration after],
+                     CHARINDEX(' ', [Expiration after] + ' ') - 1
+                )
+              ))
+            ) * 4
+    END AS Expiration_Quarters
+
+FROM dbo.vDWH_Fund_KMP;

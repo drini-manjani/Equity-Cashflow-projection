@@ -1,0 +1,10 @@
+SELECT
+    FundID,
+    [Grading Date],
+    [Grade],
+
+    YEAR([Grading Date]) AS [Year of Transaction Date],
+    DATEPART(QUARTER, [Grading Date]) AS [Quarter of Transaction Date]
+
+FROM dbo.vDWH_FundGradings
+WHERE [Grading Type] = 'Grading-P';

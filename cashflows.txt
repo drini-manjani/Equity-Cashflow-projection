@@ -1,0 +1,567 @@
+/* CE/EIG/SCCR&BS/SCPDA - l.costanzia - NG PE Model Data */
+
+WITH
+    SECONDARILY_SOLD AS (
+    SELECT fso.[FundID]
+    FROM vDWH_Fund_Subcriber_Op fso
+    GROUP BY fso.[FundID]
+    HAVING MAX(CASE WHEN fso.[TransactionType] = 'Secondary Sale - Signature' THEN 1 ELSE 0 END) = 1
+)
+  , PPG AS (
+    SELECT
+        FUND AS FundID
+      , MAX(CASE WHEN OBJECTIVE_CODE = 'CGC' THEN 'Yes' END) AS [PPG Comp & Growth]
+      , MAX(CASE WHEN OBJECTIVE_CODE = 'INV' THEN 'Yes' END) AS [PPG Innovation]
+      , MAX(CASE WHEN OBJECTIVE_CODE = 'SISHC' THEN 'Yes' END) AS [PPG Soc Imp, Sk & HC]
+      , MAX(CASE WHEN OBJECTIVE_CODE = 'SGT' THEN 'Yes' END) AS [PPG Sustainability]
+    FROM DWH_SPE_EMMPPGANDPO PPG
+    WHERE
+        PPG.FUND IS NOT NULL AND PPG.ALLOCATION IS NOT NULL
+    GROUP BY FUND
+)
+SELECT
+    f.[FundID]
+  , f.[Fund Number] AS [Business Key]
+  , f.[Fund Name]
+  , CASE f.[Fund Workflow Stage]
+        -- The first two are most likely data errors
+        WHEN 'Due Diligence' THEN 'Signed'
+        WHEN 'Conditional Commitment' THEN 'Signed'
+        WHEN 'Under termination' THEN 'Terminated'
+        ELSE f.[Fund Workflow Stage]
+    END AS [Fund Workflow Stage]
+  , COALESCE(f.[On Hold], 'No') AS [On Hold]
+  , f.[Strategy]
+  , f.[Stage Focus]
+  , f.[Investment Strategy Set Up]
+  , CASE
+        WHEN f.[FO Business Unit] = 'LMM-DP' THEN 'EIF Treasury'
+        WHEN f.[Investment Strategy Set Up] = 'Fund of Funds' THEN 'Special Structure/ FoF'
+        WHEN f.[Investment Strategy Set Up] = 'BA (Individual)' THEN 'Business Angels'
+        WHEN ppg.[PPG Soc Imp, Sk & HC] = 'Yes' THEN 'Social Impact'
+        WHEN f.[Strategy] = 'Venture Capital' THEN
+            CASE
+                WHEN f.[Stage Focus] IN ('Accelerator', 'Tech Transfer') THEN 'TTA'
+                ELSE 'Venture Capital'
+                END
+        WHEN f.[Strategy] = 'Private Debt' THEN
+            CASE
+                WHEN f.[Stage Focus] = 'Hybrid debt-equity' THEN 'Hybrid Debt-Equity'
+                ELSE 'Other Private Debt'
+                END
+        ELSE f.[Strategy]
+        END AS [Adj Strategy]
+  , f.[Vintage Year]
+  , f.[Main Sector]
+  , CASE
+        --WHEN f.[Stage Focus] = 'Growth Expansion' THEN 'VC Growth'
+        WHEN f.[Stage Focus] IN ('Mid-Market', 'Lower-Mid Market') THEN 'Lower Mid-Market'
+        WHEN f.[Stage Focus] = 'Hybrid debt-equity' THEN 'Hybrid Debt-Equity'
+        WHEN f.[Stage Focus] IN ('Balanced', 'Early Stage (Seed, Start-up and other)', 'Tech Transfer')
+            THEN f.[Stage Focus]
+        ELSE 'Other' -- Turnaround/Special Situations
+        END AS [Stage Group]
+  , COALESCE(REPLACE(f.[Geographical Focus (Regions)], '&amp;', '&'), f.[Geographical Focus (individual countries)],
+             f.[Geographical Focus]) AS [Target Geography]
+  , f.[FO Business Unit]
+  , f.[Target Fund Size (EUR Hist)] AS [Target Fund Size]
+  , COALESCE(ppg.[PPG Comp & Growth], 'No') AS [PPG Comp & Growth]
+  , COALESCE(ppg.[PPG Innovation], 'No') AS [PPG Innovation]
+  , COALESCE(ppg.[PPG Sustainability], 'No') AS [PPG Sustainability]
+  , COALESCE(ppg.[PPG Soc Imp, Sk & HC], 'No') AS [PPG Soc Imp, Sk & HC]
+  , f.[Climate]
+  , f.[Hurdle Rate]
+  , f.[% Carried Interest]
+  , f.[Fund Manager]
+  , f.[Fund Manager ID]
+  , f.[Team Location]
+  , f.[New Team]
+  , CASE
+        WHEN f.[Vintage Year] >= 2004 AND f.[First Grading-P] IN ('A', 'B') THEN 'Yes'
+        ELSE 'No'
+    END AS [Performance Portfolio]
+  , f.[First Closing Date]
+  , f.[Final Closing Date]
+  , f.[First Commitment Date (All SoF)]
+  , f.[Last Commitment Date (All SoF)]
+  , f.[Planned End Date as per legal documentation]
+  , f.[Planned end date with add. years as per legal doc]
+  , f.[Termination Date]
+  , f.[Fund Currency]
+  , f.[SOF Short Name List]
+  , f.[First Grading-P]
+  , s.[SubscriberID]
+  , s.[InvestorName]
+  , s.[SubscriberType]
+  , s.[InvestorClassification]
+  , s.[Mandate Short Name List]
+  , cf.[CloseDate] AS [Transaction Date]
+  , DATEADD(Q, DATEDIFF(Q, -1, cf.[CloseDate]), -1) AS [Transaction EoQ]
+  , CONVERT(VARCHAR(4), DATEPART(YEAR, cf.[CloseDate])) + '-Q' + CONVERT(VARCHAR(1), DATEPART(QUARTER, cf.[CloseDate])) AS [Transaction Quarter]
+  , DATEADD(Q, DATEDIFF(Q, -1, MIN(cf.[CloseDate]) OVER (PARTITION BY cf.[FundID]) ), -1) AS [First Transaction EoQ]
+  , DATEADD(Q, DATEDIFF(Q, -1, MAX(cf.[CloseDate]) OVER (PARTITION BY cf.[FundID])), -1) AS [Last Transaction EoQ]
+  , cf.[TransactionType]
+  , cf.[Transaction Description]
+  , cf.[Commitment in CCY Fund]
+  , cf.[Commitment EUR Hist Rate]
+  , cf.[Signed amount EUR Hist Rate]
+  , cf.[Signed amount in CCY Fund]
+  , CASE
+        WHEN cf.transactiontype = 'Drawdown' THEN cf.[Amount in EUR Hist Rate] -
+                                                  COALESCE(cf.[Drawdown (Equalisation Fees) EUR Hist Rate], 0)
+    END AS [Adj Drawdown (EUR Hist)]
+  , CASE
+        WHEN cf.transactiontype = 'Repayment' THEN cf.[Amount in EUR Hist Rate] -
+                                                   COALESCE(cf.[Revenue Repayment (Eq fees) EUR Hist Rate], 0)
+    END AS [Adj Repayment (EUR Hist)]
+  , CASE
+        WHEN cf.transactiontype = 'Drawdown' THEN cf.[Amount in CCY Fund] -
+                                                  COALESCE(cf.[Drawdown (Equalisation Fees) in CCY Fund], 0)
+    END AS [Adj Drawdown (CCY Fund)]
+  , CASE
+        WHEN cf.transactiontype = 'Repayment' THEN cf.[Amount in CCY Fund] -
+                                                   COALESCE(cf.[Revenue Repayment (Eq fees) in CCY Fund], 0)
+    END AS [Adj Repayment (CCY Fund)]
+    -- We are assuming there will be a single valuation date for all subscribers
+  , MAX(CASE
+            WHEN cf.transactiontype IN ('Valuation', 'Secondary Sale Proceeds') THEN cf.[CloseDate]
+            ELSE {D '1900-01-01'} END)
+      OVER (PARTITION BY
+          cf.[FundID],
+          DATEADD(Q, DATEDIFF(Q, -1, cf.[CloseDate]), -1) -- Transaction EoQ
+      ) AS [Last Valuation Date in Q]
+  , cf.[Drawdown and repay: Recallable EUR Hist Rate]
+  , cf.[IRR]
+  , cf.[NAV in CCY Fund]
+  , cf.[NAV EUR Hist Rate]
+  , cf.[Drawdown in CCY Fund]
+  , cf.[Drawdown EUR Hist Rate]
+  , cf.[Capital Repayment in CCY Fund]
+  , cf.[Capital Repayment EUR Hist Rate]
+  , cf.[Revenue Repayment in CCY Fund (REV/LOSS)]
+  , cf.[Revenue Repayment EUR Hist Rate (REV/LOSS)]
+INTO #base
+FROM
+    vDWH_Fund f
+    LEFT JOIN SECONDARILY_SOLD ss
+        ON f.[FundID] = ss.[FundID]
+    LEFT JOIN PPG
+        ON f.FundID = ppg.FundID
+    JOIN vDWH_Subscriber s
+        ON s.fundid = f.fundid
+    -- Include only funds that have some cash flows
+    JOIN vDWH_FundCashflows cf
+        ON cf.fundid = s.fundid
+        AND cf.subscriberid = s.subscriberid
+WHERE
+      f.[Fund Workflow Stage] IN (
+          -- Note that sold funds are filtered out with a different mechanism. The workflow status is not a correct indicator.
+          'Signed', 'Terminated', 'Sold', 'Earn-Out', 'Mandate Operations', 'Under termination',
+          -- These are likely data errors
+         'Due Diligence', 'Conditional Commitment'
+      )
+      -- Exclude sold funds since cash flows will be incomplete
+  AND ss.[FundID] IS NULL
+      -- Only EIF / mandate cashflows
+      --AND s.[SubscriberType] = 'Mandate-Facility EIF'
+      -- EIF Own Risk Filter (shold take care of layered funds)
+  AND s.[MandateShortName] = 'EIF'
+
+      -- Exclude JEREMIE funds transferred back to managing authorities
+  AND (s.[SOF List] IS NULL OR s.[SOF List] NOT LIKE '%JER-%' OR
+       (s.[SOF List] LIKE '%JER-%' AND f.[Fund Workflow Stage] <> 'Terminated'))
+      -- Removes PE-2004-220, PE-2004-620
+  AND f.[Main Sector] IS NOT NULL
+      -- Exclude funds invested in _only_ by treasury or GEEREF. Note that filtering by business unit is not correct!
+  AND s.[SOF List] NOT IN ('EIF Treasury', 'Global Energy Efficiency and Renewable Energy Fund', 'GEEREF RFSF')
+      -- Exclude treasury investment (For funds that have both a regular, non-treasury investment and a treasury investment)
+  AND s.[InvestorName] <> 'EIF Treasury'
+      -- Enter first day of a quarter
+  AND cf.[CloseDate] < {d'YYYY-MM-DD'}
+;
+
+WITH
+    ADJ_NAV_1 AS (
+    /* There can be more than one valuation in a quarter. Take the last one in each quarter.
+       Obtain total NAV of EIF and mandate facilities. */
+    SELECT
+        b.[FundID]
+      , b.[Transaction Quarter]
+      , b.[Transaction EoQ]
+      , b.[Last Valuation Date in Q]
+        -- Last NAV in quarter. EIF + mandate facilities
+      , SUM(b.[NAV EUR Hist Rate]) AS [NAV (EUR Hist)]
+      , SUM(b.[NAV in CCY Fund]) AS [NAV (CCY Fund)]
+    FROM
+        #BASE b
+    WHERE
+        b.[TransactionType] IN ('Valuation', 'Secondary Sale Proceeds')
+        AND b.[Last Valuation Date in Q] = b.[Transaction Date]
+    GROUP BY
+        b.[FundID]
+      , b.[Transaction Quarter]
+      , b.[Transaction EoQ]
+      , b.[Last Valuation Date in Q]
+)
+  , ADJ_NAV_2 AS (
+    /* Generate all fund-transaction quarters, and join previous info */
+    SELECT
+        f.[FundID]
+      , f.[Business Key]
+      , f.[Fund Name]
+      , f.[Fund Workflow Stage]
+      , f.[Investment Strategy Set Up]
+      , f.[Vintage Year]
+      , f.[Strategy]
+      , f.[Adj Strategy]
+      , f.[Main Sector]
+      , f.[Stage Focus]
+      , f.[Target Fund Size]
+      , f.[Team Location]
+      , f.[New Team]
+      , f.[PPG Comp & Growth]
+      , f.[PPG Innovation]
+      , f.[PPG Sustainability]
+      , f.[PPG Soc Imp, Sk & HC]
+      , f.[Climate]
+      , f.[First Closing Date]
+      , f.[Final Closing Date]
+      , f.[First Commitment Date (All SoF)]
+      , f.[Last Commitment Date (All SoF)]
+      , f.[Planned End Date as per legal documentation]
+      , f.[Planned end date with add. years as per legal doc]
+      , f.[Termination Date]
+      , f.[First Grading-P]
+      , f.[Fund Currency]
+      , f.[SOF Short Name List]
+      , f.[Mandate Short Name List]
+      , tq.[Transaction Quarter]
+      , tq.[Transaction EOQ]
+      , an.[NAV (EUR Hist)]
+      , an.[NAV (CCY Fund)]
+      , an.[Last Valuation Date in Q]
+        -- Basically a counter that increases over non null values only, thanks to implicit
+        -- ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+      , COUNT(an.[NAV (EUR Hist)]) OVER (PARTITION BY f.[FundID] ORDER BY tq.[Transaction Quarter]) AS [NonNull NAV Group]
+    FROM
+        (
+            /* Fund specific info */
+            SELECT DISTINCT
+                [FundID]
+              , [Business Key]
+              , [Fund Name]
+              , [Fund Workflow Stage]
+              , [Investment Strategy Set Up]
+              , [Vintage Year]
+              , [Strategy]
+              , [Adj Strategy]
+              , [Main Sector]
+              , [Stage Focus]
+              , [Target Fund Size]
+              , [Team Location]
+              , [New Team]
+              , [PPG Comp & Growth]
+              , [PPG Innovation]
+              , [PPG Sustainability]
+              , [PPG Soc Imp, Sk & HC]
+              , [Climate]
+              , [First Closing Date]
+              , [Final Closing Date]
+              , [First Commitment Date (All SoF)]
+              , [Last Commitment Date (All SoF)]
+              , [Planned End Date as per legal documentation]
+              , [Planned end date with add. years as per legal doc]
+              , [Termination Date]
+              , [First Grading-P]
+              , [Fund Currency]
+              , [SOF Short Name List]
+              , [Mandate Short Name List]
+              , [First Transaction EoQ]
+              , [Last Transaction EoQ]
+            FROM #BASE
+        ) f
+        JOIN (
+            SELECT DISTINCT [Transaction Quarter], [Transaction EOQ] FROM ADJ_NAV_1
+        ) tq
+            ON f.[First Transaction EoQ] <= tq.[Transaction EoQ]
+            AND tq.[Transaction EoQ] <= f.[Last Transaction Eoq]
+        LEFT JOIN ADJ_NAV_1 an
+            ON f.[FundID] = an.[FundID]
+            AND tq.[Transaction Quarter] = an.[Transaction Quarter]
+)
+  , ADJ_NAV_3 AS (
+    /* Fill NAV values forward */
+    SELECT
+        an.[FundID]
+      , an.[Business Key]
+      , an.[Fund Name]
+      , an.[Fund Workflow Stage]
+      , an.[Investment Strategy Set Up]
+      , an.[Vintage Year]
+      , an.[Strategy]
+      , an.[Adj Strategy]
+      , an.[Main Sector]
+      , an.[Stage Focus]
+      , an.[Target Fund Size]
+      , an.[Team Location]
+      , an.[New Team]
+      , an.[PPG Comp & Growth]
+      , an.[PPG Innovation]
+      , an.[PPG Sustainability]
+      , an.[PPG Soc Imp, Sk & HC]
+      , an.[Climate]
+      , an.[First Closing Date]
+      , an.[Final Closing Date]
+      , an.[First Commitment Date (All SoF)]
+      , an.[Last Commitment Date (All SoF)]
+      , an.[Planned End Date as per legal documentation]
+      , an.[Planned end date with add. years as per legal doc]
+      , an.[Termination Date]
+      , an.[First Grading-P]
+      , an.[Fund Currency]
+      , an.[SOF Short Name List]
+      , an.[Mandate Short Name List]
+      , an.[Transaction Quarter]
+      , an.[Transaction EOQ]
+      , an.[NAV (EUR Hist)]
+      , an.[Last Valuation Date in Q]
+      --, an.[NonNull NAV Group]
+      , FIRST_VALUE(an.[NAV (EUR Hist)]) OVER (
+          PARTITION BY an.[FundID], an.[NonNull NAV Group]
+          ORDER BY an.[Transaction Quarter]
+          ) AS [NAV FFilled (EUR Hist)]
+      , FIRST_VALUE(an.[NAV (CCY Fund)]) OVER (
+          PARTITION BY an.[FundID], an.[NonNull NAV Group]
+          ORDER BY an.[Transaction Quarter]
+          ) AS [NAV FFilled (CCY Fund)]
+      , FIRST_VALUE(an.[Last Valuation Date in Q]) OVER (
+          PARTITION BY an.[FundID], an.[NonNull NAV Group]
+          ORDER BY an.[Transaction Quarter]
+          ) AS [Last Valuation Date]
+    FROM
+        ADJ_NAV_2 an
+)
+  , ADJ_NAV AS (
+    /* Adjust the NAV with all drawdowns and repayments happened after the last
+       valuation date up until the end of the quarter */
+    SELECT
+        an.[FundID]
+      , an.[Business Key]
+      , an.[Fund Name]
+      , an.[Fund Workflow Stage]
+      , an.[Investment Strategy Set Up]
+      , an.[Vintage Year]
+      , an.[Strategy]
+      , an.[Adj Strategy]
+      , an.[Main Sector]
+      , an.[Stage Focus]
+      , an.[Target Fund Size]
+      , an.[Team Location]
+      , an.[New Team]
+      , an.[PPG Comp & Growth]
+      , an.[PPG Innovation]
+      , an.[PPG Sustainability]
+      , an.[PPG Soc Imp, Sk & HC]
+      , an.[Climate]
+      , an.[First Closing Date]
+      , an.[Final Closing Date]
+      , an.[First Commitment Date (All SoF)]
+      , an.[Last Commitment Date (All SoF)]
+      , an.[Planned End Date as per legal documentation]
+      , an.[Planned end date with add. years as per legal doc]
+      , an.[Termination Date]
+      , an.[First Grading-P]
+      , an.[Fund Currency]
+      , an.[SOF Short Name List]
+      , an.[Mandate Short Name List]
+      , an.[Transaction Quarter]
+      , an.[Transaction EOQ]
+      , an.[NAV (EUR Hist)]
+      , an.[Last Valuation Date in Q]
+      , an.[NAV FFilled (EUR Hist)]
+      , an.[NAV FFilled (CCY Fund)]
+      , an.[Last Valuation Date]
+      , COALESCE(SUM(b.[Adj Drawdown (EUR Hist)]), 0) - COALESCE(SUM(b.[Adj Repayment (EUR Hist)]), 0) AS [NAV Adjustment (EUR Hist)]
+      , an.[NAV FFilled (EUR Hist)] + COALESCE(SUM(b.[Adj Drawdown (EUR Hist)]), 0) - COALESCE(SUM(b.[Adj Repayment (EUR Hist)]), 0) AS [NAV Adjusted (EUR Hist)]
+      , COALESCE(SUM(b.[Adj Drawdown (CCY Fund)]), 0) - COALESCE(SUM(b.[Adj Repayment (CCY Fund)]), 0) AS [NAV Adjustment (CCY Fund)]
+      , an.[NAV FFilled (CCY Fund)] + COALESCE(SUM(b.[Adj Drawdown (CCY Fund)]), 0) - COALESCE(SUM(b.[Adj Repayment (CCY Fund)]), 0) AS [NAV Adjusted (CCY Fund)]
+    FROM
+        ADJ_NAV_3 an
+        LEFT JOIN #base b
+            ON an.[FundID] = b.[FundID]
+            AND an.[Last Valuation Date] < b.[Transaction Date]
+            AND b.[Transaction Date] <= an.[Transaction EOQ]
+    GROUP BY
+        an.[FundID]
+      , an.[Business Key]
+      , an.[Fund Name]
+      , an.[Fund Workflow Stage]
+      , an.[Investment Strategy Set Up]
+      , an.[Vintage Year]
+      , an.[Strategy]
+      , an.[Adj Strategy]
+      , an.[Main Sector]
+      , an.[Stage Focus]
+      , an.[Target Fund Size]
+      , an.[Team Location]
+      , an.[New Team]
+      , an.[PPG Comp & Growth]
+      , an.[PPG Innovation]
+      , an.[PPG Sustainability]
+      , an.[PPG Soc Imp, Sk & HC]
+      , an.[Climate]
+      , an.[First Closing Date]
+      , an.[Final Closing Date]
+      , an.[First Commitment Date (All SoF)]
+      , an.[Last Commitment Date (All SoF)]
+      , an.[Planned End Date as per legal documentation]
+      , an.[Planned end date with add. years as per legal doc]
+      , an.[Termination Date]
+      , an.[First Grading-P]
+      , an.[Fund Currency]
+      , an.[SOF Short Name List]
+      , an.[Mandate Short Name List]
+      , an.[Transaction Quarter]
+      , an.[Transaction EOQ]
+      , an.[NAV (EUR Hist)]
+      , an.[Last Valuation Date in Q]
+      , an.[NAV FFilled (EUR Hist)]
+      , an.[NAV FFilled (CCY Fund)]
+      , an.[Last Valuation Date]
+)
+SELECT
+    /* RM PE Columns */
+    an.[Fund Name] AS [VC Fund Name]
+    -- Force also inclusion of terminated funds for RM model
+  , 'Signed' AS [VC Fund Status]
+  , an.[First Commitment Date (All SoF)] AS [First Commitment Date (per Facility)]
+  , CAST(an.[Vintage Year] AS VARCHAR) + '-01-01' AS [Vintage Year]
+  , SUM(b.[Commitment in CCY Fund]) AS [Commitment in CCY]
+  , SUM(b.[Commitment EUR Hist Rate]) AS [Commitment in EUR (hist rate)]
+  , YEAR(an.[Transaction EoQ]) AS [Year of Transaction Date]
+  , DATEPART(QUARTER, an.[Transaction EoQ]) AS [Quarter of Transaction Date]
+  , AVG(b.[IRR]) AS [IRR]
+  , AVG(b.[NAV in CCY Fund]) AS [NAV in CCY]
+  , AVG(b.[NAV EUR Hist Rate]) AS [NAV in EUR (hist rate)]
+  , SUM(b.[Drawdown in CCY Fund]) AS [Drawn in CCY]
+  , SUM(b.[Drawdown EUR Hist Rate]) AS [Drawn in EUR (hist rate)]
+  , SUM(b.[Capital Repayment in CCY Fund]) AS [Capital Repayment in CCY]
+  , SUM(b.[Capital Repayment EUR Hist Rate]) AS [Capital Repayment in EUR (hist rate)]
+  , SUM(b.[Revenue Repayment in CCY Fund (REV/LOSS)]) AS [Revenue Repayment in CCY]
+  , SUM(b.[Revenue Repayment EUR Hist Rate (REV/LOSS)]) AS [Revenue Repayment in EUR (hist rate)]
+    -- Capital + Revenue Repayment, but negative values removed if transaction date is 6-7 years after first commitment
+  , SUM(CASE
+      WHEN b.[Capital Repayment in CCY Fund] < 0 AND YEAR(b.[Transaction Date]) > YEAR(an.[First Commitment Date (All SoF)]) + 6 THEN 0
+      ELSE b.[Capital Repayment in CCY Fund]
+    END
+    +
+    CASE
+      WHEN b.[Revenue Repayment in CCY Fund (REV/LOSS)] < 0 AND YEAR(b.[Transaction Date]) > YEAR(an.[First Commitment Date (All SoF)]) + 6 THEN 0
+      ELSE b.[Revenue Repayment in CCY Fund (REV/LOSS)]
+    END) AS [Adjusted capital repayment CCY]
+  , SUM(CASE
+      WHEN b.[Capital Repayment EUR Hist Rate] < 0 AND YEAR(b.[Transaction Date]) > YEAR(an.[First Commitment Date (All SoF)]) + 6 THEN 0
+      ELSE b.[Capital Repayment EUR Hist Rate]
+    END
+    +
+    CASE
+      WHEN b.[Revenue Repayment EUR Hist Rate (REV/LOSS)] < 0 AND YEAR(b.[Transaction Date]) > YEAR(an.[First Commitment Date (All SoF)]) + 6 THEN 0
+      ELSE b.[Revenue Repayment EUR Hist Rate (REV/LOSS)]
+    END) AS [Adjusted capital repayment EUR]
+  , an.[Fund Currency] AS [CCY name]
+  , CASE
+        WHEN an.[Strategy] = 'Venture Capital' THEN 'VC'
+        -- This seems to be the logic in VaR model data
+        WHEN an.[Strategy] = 'Private Equity' THEN 'LMM' + an.[First Grading-P]
+    END AS [Category]
+    /* NG columns */
+  , an.[FundID]
+  , an.[Business Key]
+  , an.[Fund Name]
+  , an.[Fund Workflow Stage]
+  , an.[Vintage Year]
+  , an.[Investment Strategy Set Up]
+  , an.[Strategy]
+  , an.[Adj Strategy]
+  , an.[Main Sector]
+  , an.[Stage Focus]
+  , an.[Target Fund Size]
+  , an.[Team Location]
+  , an.[New Team]
+  , an.[PPG Comp & Growth]
+  , an.[PPG Innovation]
+  , an.[PPG Sustainability]
+  , an.[PPG Soc Imp, Sk & HC]
+  , an.[Climate]
+  , an.[First Closing Date]
+  , an.[Final Closing Date]
+  , an.[First Commitment Date (All SoF)]
+  , an.[Last Commitment Date (All SoF)]
+  , an.[Planned End Date as per legal documentation]
+  , an.[Planned end date with add. years as per legal doc]
+  , an.[Termination Date]
+  , an.[First Grading-P]
+  , an.[Fund Currency]
+  , an.[SOF Short Name List]
+  , an.[Mandate Short Name List]
+  , an.[Transaction Quarter]
+  , b.[Transaction Date]
+  , COALESCE(SUM(b.[Commitment EUR Hist Rate]), 0) AS [Commitment EUR]
+  , COALESCE(SUM(b.[Commitment in CCY Fund]), 0) AS [Commitment CCY]
+  , COALESCE(SUM(b.[Signed amount EUR Hist Rate]), 0) AS [Signed Amount EUR]
+  , COALESCE(SUM(b.[Signed amount in CCY Fund]), 0) AS [Signed Amount CCY]
+  , COALESCE(SUM(b.[Adj Drawdown (EUR Hist)]), 0) AS [Adj Drawdown EUR]
+  , COALESCE(SUM(b.[Adj Repayment (EUR Hist)]), 0) AS [Adj Repayment EUR]
+  , COALESCE(SUM(b.[Adj Drawdown (CCY Fund)]), 0) AS [Adj Drawdown CCY]
+  , COALESCE(SUM(b.[Adj Repayment (CCY Fund)]), 0) AS [Adj Repayment CCY]
+  , COALESCE(SUM(b.[Drawdown and repay: Recallable EUR Hist Rate]), 0) AS [Recallable]
+  , COALESCE(an.[NAV FFilled (EUR Hist)], 0) AS [NAV EUR]
+  , COALESCE(an.[NAV FFilled (CCY Fund)], 0) AS [NAV CCY]
+  , COALESCE(an.[NAV Adjusted (EUR Hist)], 0) AS [NAV Adjusted EUR]
+  , COALESCE(an.[NAV Adjusted (CCY Fund)], 0) AS [NAV Adjusted CCY]
+FROM
+    ADJ_NAV an
+    LEFT JOIN #BASE b
+        ON b.[FundID] = an.[FundID]
+        AND b.[Transaction EOQ] = an.[Transaction EOQ]
+GROUP BY
+    an.[FundID]
+  , an.[Business Key]
+  , an.[Fund Name]
+  , an.[Fund Workflow Stage]
+  , an.[Vintage Year]
+  , an.[Investment Strategy Set Up]
+  , an.[Strategy]
+  , an.[Adj Strategy]
+  , an.[Main Sector]
+  , an.[Stage Focus]
+  , an.[Target Fund Size]
+  , an.[Team Location]
+  , an.[New Team]
+  , an.[PPG Comp & Growth]
+  , an.[PPG Innovation]
+  , an.[PPG Sustainability]
+  , an.[PPG Soc Imp, Sk & HC]
+  , an.[Climate]
+  , an.[First Closing Date]
+  , an.[Final Closing Date]
+  , an.[First Commitment Date (All SoF)]
+  , an.[Last Commitment Date (All SoF)]
+  , an.[Planned End Date as per legal documentation]
+  , an.[Planned end date with add. years as per legal doc]
+  , an.[Termination Date]
+  , an.[First Grading-P]
+  , an.[Fund Currency]
+  , an.[SOF Short Name List]
+  , an.[Mandate Short Name List]
+  , an.[Transaction Quarter]
+  , an.[Transaction EoQ]
+  , YEAR(b.[Transaction Date])
+  , DATEPART(QUARTER, b.[Transaction Date])
+  , an.[NAV FFilled (EUR Hist)]
+  , an.[NAV FFilled (CCY Fund)]
+  , an.[NAV Adjusted (EUR Hist)]
+  , an.[NAV Adjusted (CCY Fund)]
+  ,b.[Transaction Date]
+ORDER BY an.[Business Key], an.[Transaction Quarter]
+;
