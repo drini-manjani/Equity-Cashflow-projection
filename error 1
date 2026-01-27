@@ -1,0 +1,29 @@
+---------------------------------------------------------------------------
+TypeError                                 Traceback (most recent call last)
+Cell In[1], line 349
+    346 rep_q = grp[grp["Adj Repayment EUR"] > 0]
+    347 p_rc_given_rep = float(rep_q["rc_given_rep_event"].mean()) if len(rep_q) else 0.0
+--> 349 stats_d = fit_lognormal_stats(grp["draw_ratio"], grp["FundID"])
+    350 stats_r = fit_lognormal_stats(grp["rep_ratio"], grp["FundID"])
+    351 stats_c = fit_lognormal_stats(rep_q["rc_ratio_given_rep"], rep_q["FundID"]) if len(rep_q) else {
+    352     "mu": 0.0, "sig": SIGMA_FLOOR, "n": 0, "n_funds": 0, "ks_D": float('nan'), "ks_pass": False,
+    353 }
+
+Cell In[1], line 330, in fit_lognormal_stats(x, fund_ids)
+    328 ks_D, ks_pass = (float('nan'), False)
+    329 if n_obs >= MIN_LN_OBS and n_funds >= MIN_LN_FUNDS:
+--> 330     ks_D, ks_pass = ks_test_normal(lx, alpha=KS_ALPHA)
+    332 return {
+    333     "mu": mu, "sig": sig,
+    334     "n": n_obs, "n_funds": n_funds,
+    335     "ks_D": ks_D, "ks_pass": ks_pass,
+    336 }
+
+Cell In[1], line 298, in ks_test_normal(log_x, alpha)
+    296 # Normal CDF with fitted mu/sigma
+    297 z = (x - mu) / (sig * np.sqrt(2.0))
+--> 298 F = 0.5 * (1.0 + erf(z))
+    299 i = np.arange(1, n + 1)
+    300 d_plus = np.max(i / n - F)
+
+TypeError: only length-1 arrays can be converted to Python scalars
