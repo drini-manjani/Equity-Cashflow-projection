@@ -1,0 +1,773 @@
+# Cashflow Projection Model - Detailed Derivations
+
+This document describes, in detail, the model implemented in:
+
+- `msci_projection.ipynb`
+- `NAV Logic.ipynb`
+- `Structural-cashflows.ipynb`
+- `Structural-cashflows-mc.ipynb`
+
+It expands the derivations and shows the exact algebra and estimation logic behind each block.
+
+---
+
+## 0) Overview of the pipeline
+
+The project has three core stages:
+
+1) **MSCI projection** (macro driver)
+2) **Omega and NAV start** (valuation return driver)
+3) **Structural cashflow simulation** (draws, repayments, recallables, NAV dynamics)
+
+The model is quarterly and uses a discrete-time accounting identity to update NAV and cashflows.
+
+---
+
+## 1) Notation
+
+### 1.1 Indices
+
+- `i` : fund index
+- `t` : quarter index (integer)
+- `s` : simulation index (MC)
+
+### 1.2 Time and calendar
+
+Let `Q_t` be the quarter end date (timestamp) at step `t`.
+
+Historical data has `Year of Transaction Date` and `Quarter of Transaction Date`. We map them to:
+
+```
+Q_t = Period(Year, Quarter).to_timestamp("Q")
+```
+
+### 1.3 Core cashflow variables
+
+- `Draw_{i,t}` : drawdown amount in quarter `t`
+- `Rep_{i,t}` : repayment (distribution) amount in quarter `t`
+- `RC_{i,t}` : recallable amount added in `t`
+- `NAV_{i,t}` : NAV at end of quarter `t`
+
+### 1.4 Capacity and commitment
+
+- `C_i` : commitment for fund `i`
+- `DD_commit_{i,t}` : cumulative commitment actually used (drawn from commitment, not recallables)
+- `RC_avail_{i,t}` : recallable capacity available before drawdown at `t`
+- `RemainingCommit_{i,t}` : remaining commitment before drawdown
+- `Capacity_{i,t}` : total capacity before drawdown
+
+In code:
+
+```
+RemainingCommit_{i,t} = max(C_i - DD_commit_{i,t-1}, 0)
+Capacity_{i,t} = RemainingCommit_{i,t} + RC_avail_{i,t}
+```
+
+### 1.5 Market and valuation
+
+- `r_t` : MSCI quarterly return at `t`
+- `r_{t-1}` : lagged MSCI quarterly return
+- `omega_{i,t}` : valuation return shock for fund `i` at `t`
+
+### 1.6 Strategy and grade
+
+- `strategy_i` : fund strategy bucket (PE, VC, etc.)
+- `grade_{i,t}` : current grade in {A,B,C,D}
+- `age_{i,t}` : fund age in quarters (from vintage or first observation)
+- `AgeBucket_{i,t}` : age bucket (from configured bins)
+
+---
+
+## 2) Data transformations and derived fields
+
+### 2.1 Quarter end
+
+Given year and quarter fields:
+
+```
+quarter_end = Period(str(year) + "Q" + str(quarter), freq="Q").to_timestamp("Q")
+```
+
+### 2.2 Sorting and lagged NAV
+
+For each fund, sort by quarter end and compute:
+
+```
+NAV_prev_{i,t} = NAV_{i,t-1}
+```
+
+### 2.3 Event flags and ratios
+
+Define binary events:
+
+```
+draw_event = 1[Draw > 0]
+rep_event  = 1[Rep > 0]
+rc_given_rep_event = 1[Rep > 0 and Recallable > 0]
+```
+
+Define ratios for lognormal size calibration:
+
+```
+draw_ratio = Draw / cap_proxy
+rep_ratio  = Rep / NAV_prev
+rc_ratio_given_rep = Recallable / Rep
+```
+
+Where `cap_proxy` is either `Capacity` (if available in data) or `Commitment_Level`.
+
+### 2.4 Investment period calibration (by strategy)
+
+For each strategy `s`:
+
+- Compute total drawdown mass by age quarter:
+
+```
+D_s(q) = sum_{i,t: age_q = q, strategy = s} Draw_{i,t}
+```
+
+- Let cumulative mass be:
+
+```
+Cum_s(q) = sum_{u<=q} D_s(u)
+```
+
+- Let total mass be `Total_s = sum_q D_s(q)`.
+- Choose the smallest age `q` such that:
+
+```
+Cum_s(q) >= IP_CUM_PCTL * Total_s
+```
+
+This `q` becomes `IP_Q` for the strategy, clipped to `[IP_Q_MIN, IP_Q_MAX]`.
+
+---
+
+## 3) MSCI projection model (detailed)
+
+### 3.1 Quarterly returns
+
+Let `L_t` be the MSCI index level at quarter end `t`.
+
+```
+r_t = (L_t / L_{t-1}) - 1
+```
+
+### 3.2 Regime labeling by quantiles
+
+Compute quantiles on historical returns:
+
+```
+q_low  = quantile(r_t, low_q)
+q_high = quantile(r_t, high_q)
+```
+
+Assign regimes:
+
+```
+S_t = "bear" if r_t <= q_low
+S_t = "bull" if r_t >= q_high
+S_t = "flat" otherwise
+```
+
+### 3.3 Transition matrix with Laplace smoothing
+
+Let `N_{ab}` be the number of transitions from regime `a` to `b`.
+
+With Laplace smoothing `lambda`:
+
+```
+N'_{ab} = N_{ab} + lambda
+P_{ab} = N'_{ab} / sum_{b'} N'_{ab'}
+```
+
+### 3.4 Regime return parameters
+
+For each regime `s`, compute:
+
+```
+mu_s    = mean( r_t | S_t = s )
+sigma_s = std( r_t | S_t = s )
+```
+
+If a regime has too few observations, the global sigma is used as fallback.
+
+### 3.5 Scenario tilt (bullish/bearish)
+
+To enforce persistence, the transition matrix is tilted:
+
+Let `target` be `"bull"` for bullish and `"bear"` for bearish. For each row `a`:
+
+```
+P_tilt[a, target] *= k
+P_tilt[target, target] *= k
+```
+
+Then renormalize each row to sum to 1.
+
+### 3.6 Markov simulation
+
+Given a start state `S_0`, simulate:
+
+```
+S_{t+1} ~ Multinomial( P_tilt[S_t, :] )
+```
+
+### 3.7 Return simulation and index level reconstruction
+
+Given simulated regimes `S_t`:
+
+```
+r_t = mu_{S_t} + sigma_{S_t} * eps_t
+```
+with `eps_t ~ N(0,1)`.
+
+Reconstruct index levels:
+
+```
+L_t = L_{t-1} * (1 + r_t)
+```
+
+### 3.8 MC mean path (used in later steps)
+
+For `N` simulated paths, define per-quarter mean return:
+
+```
+mean_r_t = (1/N) * sum_{s=1..N} r_{s,t}
+```
+
+Then construct the mean index path by compounding `mean_r_t`.
+
+---
+
+## 4) Omega and NAV logic (detailed)
+
+### 4.1 Accounting identity
+
+There are two standard discrete-time identities:
+
+**A) Return applies to NAV before flows** (used for historical omega calibration):
+
+```
+NAV_t = NAV_{t-1} * (1 + omega_t) + Draw_t - Rep_t
+```
+
+Solve for omega:
+
+```
+omega_t = (NAV_t - NAV_{t-1} - Draw_t + Rep_t) / NAV_{t-1}
+```
+
+**B) Return applies to NAV after flows** (used in projection step):
+
+```
+NAV_t = (NAV_{t-1} + Draw_t - Rep_t) * (1 + omega_t)
+```
+
+In the code, historical omega is derived using form (A). For projections, omega is applied after flows (form B). When flows are small within a quarter, both are close.
+
+### 4.2 Omega regression on MSCI
+
+For each bucket (strategy x grade x age bucket), estimate:
+
+```
+omega_{i,t} = alpha_b + beta0_b * r_t + beta1_b * r_{t-1} + sigma_b * eps_{i,t}
+```
+
+The regression is fit with cluster-robust errors by fund. If a bucket is sparse, parameters fall back to larger groupings (strategy, global).
+
+### 4.3 Grade transitions
+
+Let `P_g` be a grade transition matrix for 1-year steps. If `g_t` is grade at year `t`, then:
+
+```
+g_{t+4} ~ Multinomial( P_g[g_t, :] )
+```
+
+Quarterly grades are held constant between year transitions.
+
+### 4.4 NAV start imputation
+
+If NAV at the projection start is missing:
+
+- If cumulative drawdowns exist (`Draw_cum > 0`):
+  - Estimate a lognormal distribution for `NAV / Draw_cum` from historical data.
+  - Sample ratio `R`, set:
+
+```
+NAV_start = R * Draw_cum
+```
+
+- If no drawdowns exist: `NAV_start = 0`.
+
+---
+
+## 5) Structural cashflow model (detailed)
+
+### 5.1 State variables per fund
+
+At the start of quarter `t`, we track:
+
+- `NAV_prev`
+- `DD_commit` (commitment used)
+- `RC_avail` (recallable availability)
+- `grade` and `age`
+- `q_left` (quarters left to cap or lifetime end)
+
+### 5.2 Capacity and commitment
+
+Let commitment `C_i` be derived from commitment levels in the historical data (cumulative commitment if available).
+
+Remaining commitment before drawdown:
+
+```
+RemainingCommit_pre = max(C_i - DD_commit, 0)
+```
+
+Available recallables are tracked by a ledger (see 5.3).
+
+Total capacity:
+
+```
+Capacity_pre = RemainingCommit_pre + RC_avail_pre
+```
+
+### 5.3 Recallable ledger (mechanics)
+
+Recallables are modeled as buckets, each with:
+
+- `created_q`: quarter index when created
+- `expiry_q`: quarter index when it expires
+- `amount_remaining`
+
+#### 5.3.1 Recallable cap
+
+Per fund, a recallable cap is defined as:
+
+```
+RC_cap = rho * C_i
+```
+
+where `rho` is the recallable percentage.
+
+#### 5.3.2 Adding recallables
+
+When a repayment occurs, a recallable amount is sampled and added:
+
+```
+RC_added = rc_ratio * Rep_regular
+```
+
+If `RC_added` would breach the cap, it is reduced to fit.
+
+#### 5.3.3 Consuming recallables
+
+When a drawdown occurs, recallables are used first (FIFO). The remainder (if any) is drawn from commitment.
+
+```
+use_rc = min(RC_avail, Draw_amount)
+use_commit = Draw_amount - use_rc
+DD_commit += use_commit
+```
+
+### 5.4 Investment period and drawdown age shape
+
+A strategy-level `IP_Q` is calibrated (Section 2.4). The drawdown probability is shaped by age:
+
+```
+if age <= IP_Q:
+    frac = age / IP_Q
+    draw_mult = max(DRAW_AGE_MIN_MULT, (1 - frac)^DRAW_AGE_DECAY_POWER)
+else:
+    draw_mult = 0 (only if ENFORCE_IP_LIMITS is True)
+```
+
+If `ENFORCE_IP_LIMITS` is enabled and `age == IP_Q`, the remaining commitment is forced to be drawn.
+
+### 5.5 Hazard models for event timing
+
+We model event probabilities for drawdown, repayment, and recallable:
+
+- `p_draw` : probability of a drawdown event
+- `p_rep` : probability of a repayment event
+- `p_rc_given_rep` : probability of recallable conditional on repayment
+
+#### 5.5.1 Logistic regression (global fit)
+
+Let `X` be features and `y` be event indicators. We fit:
+
+```
+P(y=1 | X) = sigmoid(X beta)
+```
+
+Features (standardized) include:
+
+- `age_q`, `age_q^2`
+- dummies for `Adj Strategy`
+- dummies for `Grade`
+- `log_nav_prev` for repayment hazard
+
+The model is fit with IRLS (iteratively reweighted least squares) and L2 regularization:
+
+```
+beta_{new} = (X^T W X + lambda I)^{-1} X^T W z
+```
+
+where:
+
+```
+W = diag(p_hat * (1 - p_hat))
+z = X beta + (y - p_hat)/W
+p_hat = sigmoid(X beta)
+```
+
+If the hazard fit fails, the model falls back to group means.
+
+#### 5.5.2 Empirical hazard fallback
+
+For any bucket `b`:
+
+```
+p_draw(b) = mean(draw_event | b)
+p_rep(b)  = mean(rep_event | b)
+```
+
+The hazard used in simulation is either the logit probability (if enabled) or the empirical hazard from bucket shrinkage (Section 6.3).
+
+### 5.6 Lognormal size models
+
+For each cashflow size ratio, we assume a lognormal distribution:
+
+```
+log(ratio) ~ Normal(mu, sigma^2)
+```
+
+#### 5.6.1 MLE for lognormal parameters
+
+Given ratios `r_1,...,r_n`:
+
+```
+mu_hat = (1/n) * sum log(r_i)
+
+sigma_hat^2 = (1/(n-1)) * sum (log(r_i) - mu_hat)^2
+```
+
+Sigma is clipped to `[SIGMA_FLOOR, SIGMA_CAP]`.
+
+#### 5.6.2 Sampling
+
+Given a uniform `u` from the copula:
+
+```
+z = Phi^{-1}(u)
+ratio = exp(mu + sigma * z)
+```
+
+Ratios are clipped to `[0,1]` as needed.
+
+### 5.7 Copula for dependence
+
+The model uses a one-factor Gaussian copula per quarter.
+
+Given correlation `rho`:
+
+```
+Z ~ N(0,1)  (common factor)
+eps_i ~ N(0,1) (idiosyncratic)
+
+X_i = sqrt(rho) * Z + sqrt(1 - rho) * eps_i
+u_i = Phi(X_i)
+```
+
+Separate copulas are used for:
+
+- `event` uniforms: draw_event, rep_event, rc_event
+- `size` uniforms: draw_size, rep_size, rc_size
+
+Two parameters control dependence:
+
+- `RHO_EVENT`
+- `RHO_SIZE`
+
+### 5.8 Grade coherence adjustments
+
+Grades adjust both timing and sizes to enforce ordering (A best, D worst).
+
+```
+p_draw_adj = p_draw * GRADE_DRAW_P_MULT[grade]
+ratio_draw_adj = ratio_draw * GRADE_DRAW_SIZE_MULT[grade]
+
+p_rep_adj = p_rep * GRADE_P_MULT[grade]
+ratio_rep_adj = ratio_rep * GRADE_SIZE_MULT[grade]
+```
+
+Values are clipped to keep probabilities in `[0,1]` and sizes in `[0,1]`.
+
+### 5.9 MSCI direct effects on repayments
+
+Let `msci_z` be a standardized return:
+
+```
+msci_z = (r_t - mu_r) / sigma_r
+msci_z = clip(msci_z, -MSCI_Z_CLIP, MSCI_Z_CLIP)
+```
+
+Optionally, only positive MSCI shocks are used (`msci_z_eff = max(msci_z, 0)` if configured).
+
+Two effects:
+
+1) **Hazard boost (logit shift)**
+
+```
+logit(p_rep_adj) = logit(p_rep_adj) + MSCI_REP_P_BETA * msci_z_eff
+```
+
+2) **Size boost**
+
+```
+rep_ratio = rep_ratio * (1 + MSCI_REP_SIZE_BETA * msci_z_eff)
+```
+
+### 5.10 Repayment ramp near end of life
+
+As a fund approaches the end, repayment probability and size are ramped up:
+
+```
+ tail_factor = max(0, (RUNOFF_Q - q_left)/RUNOFF_Q)
+ p_rep_adj = 1 - (1 - p_rep_base)^(1 + REP_RAMP_P * runoff_mult * tail_factor)
+ p_rep_adj += REP_RAMP_FLOOR * tail_factor
+ rep_ratio *= (1 + REP_RAMP_SIZE * runoff_mult * tail_factor)
+```
+
+### 5.11 Terminal runoff to force NAV toward zero
+
+Define:
+
+```
+available_nav = max(NAV_prev + Draw - Rep_regular, 0)
+```
+
+When `q_left < RUNOFF_Q`, compute a target NAV that shrinks geometrically:
+
+```
+base_ratio = q_left / (q_left + 1)
+NAV_target = available_nav * (base_ratio ^ runoff_mult)
+Rep_terminal = max(0, available_nav - NAV_target)
+```
+
+This creates a smooth amortization to zero without a terminal spike.
+
+### 5.12 NAV update in projection
+
+```
+NAV_after_flow = max(available_nav - Rep_terminal, 0)
+NAV_end = max(NAV_after_flow * (1 + omega_t), 0)
+```
+
+### 5.13 Summary of the per-quarter algorithm
+
+For each fund and quarter:
+
+1) Compute capacity and available recallables.
+2) Draw uniforms from the copula (events + sizes).
+3) Determine drawdown event and size, update commitment usage.
+4) Determine repayment event and size (with grade + MSCI boosts).
+5) Add recallables if repayment occurs.
+6) Apply terminal runoff if near end.
+7) Update NAV using omega.
+8) Persist state to next quarter.
+
+---
+
+## 6) Calibration and shrinkage (detailed)
+
+### 6.1 Bucket definitions
+
+Primary bucket:
+
+```
+(strategy, grade, age_bucket)
+```
+
+Fallback buckets:
+
+- strategy + grade
+- strategy + age
+- strategy
+- global
+
+### 6.2 KS test for lognormal fit
+
+We test lognormality of `log(ratio)` using the KS test.
+
+Let `F_n(x)` be the empirical CDF of `log(ratio)`. Let `F(x)` be the fitted Normal CDF with `mu_hat, sigma_hat`.
+
+The KS statistic:
+
+```
+D = max_x |F_n(x) - F(x)|
+```
+
+Critical value (approx):
+
+```
+D_crit = sqrt( -0.5 * ln(alpha/2) / n )
+```
+
+If `D <= D_crit`, the lognormal fit is accepted.
+
+### 6.3 Shrinkage weights
+
+For hazards, a weight is defined as:
+
+```
+weight_h(n_obs, n_funds) = (n_obs / (n_obs + SHRINK_N))
+                           * (n_funds / (n_funds + SHRINK_FUNDS))
+```
+
+For lognormal sizes, the same formula is used but only if the KS test passes.
+
+### 6.4 Hazard shrinkage (p_draw, p_rep, p_rc)
+
+Let:
+
+- `p_sg` = strategy+grade hazard
+- `p_sa` = strategy+age hazard
+- `p_s`  = strategy hazard
+
+Compute weighted parent:
+
+```
+W_sg = weight_h(n_sg, nf_sg)
+W_sa = weight_h(n_sa, nf_sa)
+T = W_sg + W_sa
+
+if T > 0:
+    p_mid = (W_sg * p_sg + W_sa * p_sa) / T
+    p_parent = T * p_mid + (1 - T) * p_s
+else:
+    p_parent = p_s
+```
+
+Then blend with child (strategy+grade+age):
+
+```
+W_child = weight_h(n_child, nf_child)
+
+p_final = W_child * p_child + (1 - W_child) * p_parent
+```
+
+### 6.5 Lognormal shrinkage (mu, sigma)
+
+For each ratio type (draw, rep, rc), we do hierarchical shrinkage:
+
+1) Blend strategy with global
+2) Blend (strategy+grade) with strategy
+3) Blend (strategy+age) with strategy
+4) Combine (strategy+grade) and (strategy+age) into a parent
+5) Blend child with the parent
+
+The generic blend formula:
+
+```
+(mu, sigma) = W * (mu_child, sigma_child) + (1-W) * (mu_parent, sigma_parent)
+```
+
+where `W` is the KS-gated weight defined above.
+
+This preserves the most granular bucket when it is well supported, while shrinking to broader buckets when data is sparse or non-lognormal.
+
+### 6.6 Runoff calibration by strategy
+
+For each strategy, a runoff multiplier is estimated by comparing tail vs mid repayments.
+
+Let `rep_ratio` be repayment/NAV. Define:
+
+- Tail quarters: last `RUNOFF_Q` quarters before end
+- Mid quarters: earlier quarters
+
+```
+runoff_mult = mean(rep_ratio_tail) / mean(rep_ratio_mid)
+```
+
+Then clip to `[RUNOFF_MULT_MIN, RUNOFF_MULT_MAX]`.
+
+---
+
+## 7) Monte Carlo mode
+
+In MC mode, the entire simulation is repeated `N_SIM` times with different random seeds.
+
+Per simulation `s`, the model produces a full path of cashflows and NAV.
+
+The mean path is computed as:
+
+```
+mean_X_{i,t} = (1/N_SIM) * sum_s X_{i,t}^{(s)}
+```
+
+This implies that event indicators (like `Draw_Event`) become frequencies in the mean output.
+
+---
+
+## 8) Output fields (key)
+
+- `Draw_Event` : drawdown event indicator (or MC frequency)
+- `Draw_Amount` : drawdown size
+- `Rep_Event` : repayment event indicator (or MC frequency)
+- `Rep_Regular` : repayment amount from lognormal size
+- `Rep_Terminal` : terminal runoff repayment
+- `Rep_Total` : sum of regular + terminal
+- `RC_Event` : recallable event indicator
+- `RC_Added` : recallable added
+- `NAV_prev`, `NAV_end`
+- `Capacity_Pre`, `Remaining_Commit_Pre`, `RC_Avail_Pre`
+- `tail_factor` : ramp factor near end of life
+
+---
+
+## 9) Model invariants and checks
+
+The simulation enforces:
+
+- `NAV_end >= 0`
+- `Draw_Amount <= Capacity_Pre`
+- `RemainingCommit_Pre >= 0`
+- Recallables never exceed `rho * commitment`
+- Recallables expire after `E` quarters
+- If projections reach end of life, NAV is amortized toward 0
+
+---
+
+## 10) Quick equation recap
+
+**Omega (calibration)**
+```
+omega_t = (NAV_t - NAV_{t-1} - Draw_t + Rep_t) / NAV_{t-1}
+```
+
+**NAV update (projection)**
+```
+NAV_end = max( (NAV_prev + Draw - Rep_regular - Rep_terminal) * (1 + omega_t), 0 )
+```
+
+**Drawdown size**
+```
+Draw = Capacity_pre * exp(mu_draw + sigma_draw * z)
+```
+
+**Repayment size**
+```
+Rep = NAV_prev * exp(mu_rep + sigma_rep * z)
+```
+
+**Recallable size**
+```
+RC = Rep * exp(mu_rc + sigma_rc * z)
+```
+
+**Terminal runoff**
+```
+Rep_terminal = max(0, available_nav - available_nav * (q_left/(q_left+1))^runoff_mult)
+```
+
