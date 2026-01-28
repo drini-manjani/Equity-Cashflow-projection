@@ -1404,19 +1404,25 @@ def main():
     # Build per-fund actual grid
     for fid in fund_states.keys():
         hist = data_by_fund[fid].copy().sort_values("quarter_end")
-        hist = hist.set_index("quarter_end")
+        # collapse any duplicate quarter_end rows before aligning to grid
+        hist_q = (hist.groupby("quarter_end", as_index=True)
+                  .agg({
+                      "Adj Drawdown EUR": "sum",
+                      "Adj Repayment EUR": "sum",
+                      "NAV Adjusted EUR": "last",
+                  }))
         # grid for test quarters
         grid = pd.DataFrame(index=pd.Index(test_quarters, name="quarter_end"))
-        grid["Draw"] = hist["Adj Drawdown EUR"]
-        grid["Rep"] = hist["Adj Repayment EUR"]
-        grid["NAV"] = hist["NAV Adjusted EUR"]
+        grid["Draw"] = hist_q["Adj Drawdown EUR"]
+        grid["Rep"] = hist_q["Adj Repayment EUR"]
+        grid["NAV"] = hist_q["NAV Adjusted EUR"]
 
         # Fill missing: Draw/Rep = 0, NAV = ffill from last known (including pre-test)
         grid["Draw"] = grid["Draw"].fillna(0.0)
         grid["Rep"] = grid["Rep"].fillna(0.0)
 
         # seed NAV from last known before test start
-        nav_seed = hist.loc[hist.index <= train_end_qe, "NAV Adjusted EUR"]
+        nav_seed = hist_q.loc[hist_q.index <= train_end_qe, "NAV Adjusted EUR"]
         nav_seed = float(nav_seed.iloc[-1]) if len(nav_seed) else 0.0
         grid["NAV"] = grid["NAV"].ffill().fillna(nav_seed)
 
