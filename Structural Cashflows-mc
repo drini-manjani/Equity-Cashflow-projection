@@ -31,7 +31,7 @@ Copula:
 - Separate copula draws per component: draw_event, draw_size, rep_event, rep_size, rc_event, rc_size.
 
 Outputs:
-- structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.(csv|parquet)
+- structural_cashflows_endogenous_mean_{year}_{quarter}_{n_q}q_{N_SIM}sims.(csv|parquet)
 """
 
 import os
@@ -1249,35 +1249,40 @@ for run_id in range(1, n_runs + 1):
                 row_out["sim_id"] = int(sim_label)
                 out.append(row_out)
 
-# Build output dataframe
-if N_SIM > 1:
-    rows = []
-    for key, sums in agg_sum.items():
-        cnt = agg_cnt.get(key, 1)
-        meta = agg_meta.get(key, {})
-        row = dict(meta)
-        for c in AVG_COLS:
-            row[c] = sums[c] / float(cnt)
-        rows.append(row)
-    sim = pd.DataFrame(rows)
-else:
-    sim = pd.DataFrame(out)
-if sim.empty or "FundID" not in sim.columns:
-    raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
+        # Build output dataframe
+        if N_SIM > 1:
+            rows = []
+            for key, sums in agg_sum.items():
+                cnt = agg_cnt.get(key, 1)
+                meta = agg_meta.get(key, {})
+                row = dict(meta)
+                for c in AVG_COLS:
+                    row[c] = sums[c] / float(cnt)
+                rows.append(row)
+            sim = pd.DataFrame(rows)
+        else:
+            sim = pd.DataFrame(out)
 
-sim = pd.DataFrame(out)
-if sim.empty or "FundID" not in sim.columns:
-    raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
-print("\nSimulated rows:", len(sim))
-print("Simulated funds:", sim["FundID"].nunique())
+        if sim.empty or "FundID" not in sim.columns:
+            raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
 
+        print("
+Simulated rows:", len(sim))
+        print("Simulated funds:", sim["FundID"].nunique())
+        if N_SIM > 1:
+            print("Structural MC sims:", N_SIM)
 # =============================
 # Save
 # =============================
 save = input("Save structural cashflow outputs? (y/n) [y]: ").strip().lower()
 if save in {"", "y", "yes"}:
-    out_csv = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.csv")
-    out_pq  = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.parquet")
+    if N_SIM > 1:
+        out_csv = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_mean_{year}_{quarter}_{n_q}q_{N_SIM}sims.csv")
+        out_pq  = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_mean_{year}_{quarter}_{n_q}q_{N_SIM}sims.parquet")
+    else:
+        out_csv = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.csv")
+        out_pq  = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.parquet")
+
     sim.to_csv(out_csv, index=False, sep=";", encoding="utf-8-sig")
     sim.to_parquet(out_pq, index=False)
     print("Saved:")
@@ -1372,6 +1377,9 @@ check_out.to_csv(check_csv, index=False)
 check_out.to_parquet(check_pq, index=False)
 print("Saved check:", check_csv)
 print("Saved check:", check_pq)
+
+
+
 
 
 
