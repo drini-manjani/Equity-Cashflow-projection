@@ -1,11 +1,11 @@
 ---------------------------------------------------------------------------
 ValueError                                Traceback (most recent call last)
-Cell In[5], line 1803
+Cell In[1], line 1803
    1799     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
    1802 if __name__ == "__main__":
 -> 1803     main()
 
-Cell In[5], line 1410, in main()
+Cell In[1], line 1410, in main()
    1408 # grid for test quarters
    1409 grid = pd.DataFrame(index=pd.Index(test_quarters, name="quarter_end"))
 -> 1410 grid["Draw"] = hist["Adj Drawdown EUR"]
