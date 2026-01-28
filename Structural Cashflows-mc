@@ -55,8 +55,10 @@ n_q = int(input("Enter number of quarters to simulate (0 => default 40): ").stri
 if n_q == 0:
     n_q = 40
 
-RHO_MKT = float(input("Single-factor copula correlation rho_mkt [0.25]: ").strip() or "0.25")
-RHO_MKT = float(np.clip(RHO_MKT, 0.0, 0.999))
+RHO_EVENT = float(input("Copula correlation for events rho_event [0.25]: ").strip() or "0.25")
+RHO_SIZE = float(input("Copula correlation for sizes rho_size [0.15]: ").strip() or "0.15")
+RHO_EVENT = float(np.clip(RHO_EVENT, 0.0, 0.999))
+RHO_SIZE = float(np.clip(RHO_SIZE, 0.0, 0.999))
 
 SEED = int(input("Random seed [1234]: ").strip() or "1234")
 
@@ -96,6 +98,11 @@ REP_RAMP_P = 2.0         # strength for repayment probability ramp
 REP_RAMP_SIZE = 1.0      # strength for repayment size ramp
 REP_RAMP_FLOOR = 0.05    # minimum repayment prob added in tail
 
+# terminal runoff calibration (by strategy)
+USE_RUNOFF_CALIBRATION = True
+RUNOFF_MULT_MIN = 0.5
+RUNOFF_MULT_MAX = 3.0
+
 # investment period / drawdown shape controls
 IP_YEARS_DEFAULT = 5
 IP_Q_DEFAULT = int(IP_YEARS_DEFAULT * 4)
@@ -112,6 +119,10 @@ USE_DRAW_AGE_SHAPE = False  # optional age decay multiplier (soft shape)
 # grade monotonicity controls (A better than B, etc.)
 GRADE_P_MULT = {"A": 1.15, "B": 1.00, "C": 0.85, "D": 0.70}
 GRADE_SIZE_MULT = {"A": 1.10, "B": 1.00, "C": 0.90, "D": 0.80}
+
+# drawdown grade multipliers (A better than D)
+GRADE_DRAW_P_MULT = {"A": 0.95, "B": 1.00, "C": 1.05, "D": 1.10}
+GRADE_DRAW_SIZE_MULT = {"A": 0.95, "B": 1.00, "C": 1.05, "D": 1.10}
 
 # MSCI direct sensitivity (repayment hazard/size)
 MSCI_REP_P_BETA = 0.6     # logit shift per 1 std of MSCI
@@ -268,9 +279,13 @@ data["NAV Adjusted EUR"] = data["NAV Adjusted EUR"].fillna(0.0).clip(lower=0.0)
 data["Fund_Age_Quarters"] = data["Fund_Age_Quarters"].fillna(0.0)
 
 # quarter_end + ordering
+q_year = pd.to_numeric(data["Year of Transaction Date"], errors="coerce")
+q_qtr = pd.to_numeric(data["Quarter of Transaction Date"], errors="coerce")
+if q_year.isna().any() or q_qtr.isna().any():
+    raise ValueError("Year/Quarter of Transaction Date contains non-numeric values.")
+
 data["quarter_end"] = pd.PeriodIndex(
-    data["Year of Transaction Date"].astype(int).astype(str) + "Q" +
-    data["Quarter of Transaction Date"].astype(int).astype(str),
+    q_year.astype("int64").astype(str) + "Q" + q_qtr.astype("int64").astype(str),
     freq="Q"
 ).to_timestamp("Q")
 data["quarter_end"] = pd.to_datetime(data["quarter_end"])
@@ -330,6 +345,31 @@ data.loc[data["draw_ratio"] <= 0, "draw_ratio"] = np.nan
 data["rep_ratio"] = np.where(data["nav_prev"].abs() > NAV_EPS, data["Adj Repayment EUR"] / data["nav_prev"].abs(), np.nan)
 data.loc[data["rep_ratio"] <= 0, "rep_ratio"] = np.nan
 
+# terminal runoff calibration by strategy (based on repayment ratios near fund end)
+runoff_mult_by_strategy = {}
+if USE_RUNOFF_CALIBRATION:
+    last_qe_map = data.groupby("FundID")["quarter_end"].transform("max")
+    q_ord = data["quarter_end"].dt.to_period("Q").astype("int64")
+    q_last = last_qe_map.dt.to_period("Q").astype("int64")
+    data["q_to_end"] = (q_last - q_ord).astype(int)
+
+    rep_df = data.dropna(subset=["rep_ratio", "Adj Strategy", "q_to_end"]).copy()
+    tail = rep_df[(rep_df["q_to_end"] >= 0) & (rep_df["q_to_end"] < RUNOFF_Q)]
+    mid = rep_df[rep_df["q_to_end"] >= RUNOFF_Q]
+
+    for strat, g in rep_df.groupby("Adj Strategy", dropna=False):
+        g_tail = tail[tail["Adj Strategy"] == strat]
+        g_mid = mid[mid["Adj Strategy"] == strat]
+        if len(g_tail) < 20 or len(g_mid) < 20:
+            runoff_mult_by_strategy[strat] = 1.0
+            continue
+        tail_mean = float(g_tail["rep_ratio"].mean())
+        mid_mean = float(g_mid["rep_ratio"].mean())
+        if (not np.isfinite(tail_mean)) or (not np.isfinite(mid_mean)) or mid_mean <= 0:
+            runoff_mult_by_strategy[strat] = 1.0
+            continue
+        mult = float(np.clip(tail_mean / mid_mean, RUNOFF_MULT_MIN, RUNOFF_MULT_MAX))
+        runoff_mult_by_strategy[strat] = mult
 data["rc_given_rep_event"] = ((data["Adj Repayment EUR"] > 0) & (data["Recallable"] > 0)).astype(int)
 data["rc_ratio_given_rep"] = np.where(data["Adj Repayment EUR"] > 0, data["Recallable"] / data["Adj Repayment EUR"], np.nan)
 data.loc[data["rc_ratio_given_rep"] <= 0, "rc_ratio_given_rep"] = np.nan
@@ -559,7 +599,8 @@ for (s,g,a), grp in data.groupby(group_keys, dropna=False):
         "n_rep": stats_r["n"], "n_funds_rep": stats_r["n_funds"], "ks_rep": stats_r["ks_D"], "ks_pass_rep": stats_r["ks_pass"],
         "mu_rc": stats_c["mu"], "sig_rc": stats_c["sig"],
         "n_rc": stats_c["n"], "n_funds_rc": stats_c["n_funds"], "ks_rc": stats_c["ks_D"], "ks_pass_rc": stats_c["ks_pass"],
-        "n_obs": int(len(grp))
+        "n_obs": int(len(grp)),
+        "n_funds": int(grp["FundID"].nunique())
     })
 cal = pd.DataFrame(rows)
 
@@ -587,8 +628,68 @@ for s, grp in data.groupby(["Adj Strategy"], dropna=False):
         "n_rep": stats_r["n"], "n_funds_rep": stats_r["n_funds"], "ks_rep": stats_r["ks_D"], "ks_pass_rep": stats_r["ks_pass"],
         "mu_rc": stats_c["mu"], "sig_rc": stats_c["sig"],
         "n_rc": stats_c["n"], "n_funds_rc": stats_c["n_funds"], "ks_rc": stats_c["ks_D"], "ks_pass_rc": stats_c["ks_pass"],
+        "n_obs": int(len(grp)),
+        "n_funds": int(grp["FundID"].nunique())
     })
 cal_s = pd.DataFrame(rows_s)
+
+# strategy + grade fallback
+rows_sg = []
+for (s, g), grp in data.groupby(["Adj Strategy","Grade"], dropna=False):
+    p_draw = float(grp["draw_event"].mean()) if len(grp) else 0.0
+    p_rep  = float(grp["rep_event"].mean()) if len(grp) else 0.0
+
+    rep_q = grp[grp["Adj Repayment EUR"] > 0]
+    p_rc_given_rep = float(rep_q["rc_given_rep_event"].mean()) if len(rep_q) else 0.0
+
+    stats_d = fit_lognormal_stats(grp["draw_ratio"], grp["FundID"])
+    stats_r = fit_lognormal_stats(grp["rep_ratio"], grp["FundID"])
+    stats_c = fit_lognormal_stats(rep_q["rc_ratio_given_rep"], rep_q["FundID"]) if len(rep_q) else {
+        "mu": 0.0, "sig": SIGMA_FLOOR, "n": 0, "n_funds": 0, "ks_D": float('nan'), "ks_pass": False,
+    }
+
+    rows_sg.append({
+        "Adj Strategy": s, "Grade": g,
+        "p_draw": p_draw, "p_rep": p_rep, "p_rc_given_rep": p_rc_given_rep,
+        "mu_draw": stats_d["mu"], "sig_draw": stats_d["sig"],
+        "n_draw": stats_d["n"], "n_funds_draw": stats_d["n_funds"], "ks_draw": stats_d["ks_D"], "ks_pass_draw": stats_d["ks_pass"],
+        "mu_rep": stats_r["mu"], "sig_rep": stats_r["sig"],
+        "n_rep": stats_r["n"], "n_funds_rep": stats_r["n_funds"], "ks_rep": stats_r["ks_D"], "ks_pass_rep": stats_r["ks_pass"],
+        "mu_rc": stats_c["mu"], "sig_rc": stats_c["sig"],
+        "n_rc": stats_c["n"], "n_funds_rc": stats_c["n_funds"], "ks_rc": stats_c["ks_D"], "ks_pass_rc": stats_c["ks_pass"],
+        "n_obs": int(len(grp)),
+        "n_funds": int(grp["FundID"].nunique())
+    })
+cal_sg = pd.DataFrame(rows_sg)
+
+# strategy + age fallback
+rows_sa = []
+for (s, a), grp in data.groupby(["Adj Strategy","AgeBucket"], dropna=False):
+    p_draw = float(grp["draw_event"].mean()) if len(grp) else 0.0
+    p_rep  = float(grp["rep_event"].mean()) if len(grp) else 0.0
+
+    rep_q = grp[grp["Adj Repayment EUR"] > 0]
+    p_rc_given_rep = float(rep_q["rc_given_rep_event"].mean()) if len(rep_q) else 0.0
+
+    stats_d = fit_lognormal_stats(grp["draw_ratio"], grp["FundID"])
+    stats_r = fit_lognormal_stats(grp["rep_ratio"], grp["FundID"])
+    stats_c = fit_lognormal_stats(rep_q["rc_ratio_given_rep"], rep_q["FundID"]) if len(rep_q) else {
+        "mu": 0.0, "sig": SIGMA_FLOOR, "n": 0, "n_funds": 0, "ks_D": float('nan'), "ks_pass": False,
+    }
+
+    rows_sa.append({
+        "Adj Strategy": s, "AgeBucket": a,
+        "p_draw": p_draw, "p_rep": p_rep, "p_rc_given_rep": p_rc_given_rep,
+        "mu_draw": stats_d["mu"], "sig_draw": stats_d["sig"],
+        "n_draw": stats_d["n"], "n_funds_draw": stats_d["n_funds"], "ks_draw": stats_d["ks_D"], "ks_pass_draw": stats_d["ks_pass"],
+        "mu_rep": stats_r["mu"], "sig_rep": stats_r["sig"],
+        "n_rep": stats_r["n"], "n_funds_rep": stats_r["n_funds"], "ks_rep": stats_r["ks_D"], "ks_pass_rep": stats_r["ks_pass"],
+        "mu_rc": stats_c["mu"], "sig_rc": stats_c["sig"],
+        "n_rc": stats_c["n"], "n_funds_rc": stats_c["n_funds"], "ks_rc": stats_c["ks_D"], "ks_pass_rc": stats_c["ks_pass"],
+        "n_obs": int(len(grp)),
+        "n_funds": int(grp["FundID"].nunique())
+    })
+cal_sa = pd.DataFrame(rows_sa)
 
 # global fallback
 global_p_draw = float(data["draw_event"].mean())
@@ -610,6 +711,46 @@ def _weight(n_obs: float, n_funds: float, ks_pass: bool) -> float:
         return 0.0
     w = (n_obs / (n_obs + SHRINK_N)) * (n_funds / (n_funds + SHRINK_FUNDS))
     return float(np.clip(w, 0.0, 1.0))
+
+
+def _weight_h(n_obs: float, n_funds: float) -> float:
+    if n_obs is None or n_obs <= 0 or n_funds is None or n_funds <= 0:
+        return 0.0
+    w = (n_obs / (n_obs + SHRINK_N)) * (n_funds / (n_funds + SHRINK_FUNDS))
+    return float(np.clip(w, 0.0, 1.0))
+
+
+def _blend_p(p_c: float, n_c: float, nf_c: float, p_p: float) -> float:
+    w = _weight_h(n_c, nf_c)
+    return float(np.clip(w * float(p_c) + (1.0 - w) * float(p_p), 0.0, 1.0))
+
+
+def _combine_p(p_sg, n_sg, nf_sg, p_sa, n_sa, nf_sa, p_s):
+    w_sg = _weight_h(n_sg, nf_sg)
+    w_sa = _weight_h(n_sa, nf_sa)
+    tot = w_sg + w_sa
+    if tot > 0:
+        p_mid = (w_sg * float(p_sg) + w_sa * float(p_sa)) / tot
+        return float(np.clip(tot * p_mid + (1.0 - tot) * float(p_s), 0.0, 1.0))
+    return float(np.clip(float(p_s), 0.0, 1.0))
+
+
+def _combine_mu_sig(mu_sg, sig_sg, n_sg, nf_sg, ks_sg,
+                    mu_sa, sig_sa, n_sa, nf_sa, ks_sa,
+                    mu_s, sig_s):
+    w_sg = _weight(n_sg, nf_sg, ks_sg)
+    w_sa = _weight(n_sa, nf_sa, ks_sa)
+    tot = w_sg + w_sa
+    if tot > 0:
+        mu_mid = (w_sg * float(mu_sg) + w_sa * float(mu_sa)) / tot
+        sig_mid = (w_sg * float(sig_sg) + w_sa * float(sig_sa)) / tot
+        mu = tot * mu_mid + (1.0 - tot) * float(mu_s)
+        sig = tot * sig_mid + (1.0 - tot) * float(sig_s)
+    else:
+        mu = float(mu_s)
+        sig = float(sig_s)
+    sig = float(np.clip(max(sig, SIGMA_FLOOR), SIGMA_FLOOR, SIGMA_CAP))
+    return mu, sig
 
 def _blend(mu_c, sig_c, n_c, nf_c, ks_c, mu_p, sig_p, n_p, nf_p, ks_p):
     w = _weight(n_c, nf_c, ks_c)
@@ -682,45 +823,121 @@ def lookup_params(strategy, grade, age_bucket) -> Dict[str, float]:
     child = cal[m].iloc[0].to_dict() if m.any() else {}
 
     ss = cal_s[cal_s["Adj Strategy"].eq(strategy)]
-    parent = ss.iloc[0].to_dict() if len(ss) else {}
+    parent_s = ss.iloc[0].to_dict() if len(ss) else {}
 
-    # hazards (no shrinkage)
-    p_draw = float(np.clip(child.get("p_draw", parent.get("p_draw", global_p_draw)), 0.0, 1.0))
-    p_rep  = float(np.clip(child.get("p_rep", parent.get("p_rep", global_p_rep)), 0.0, 1.0))
-    p_rc   = float(np.clip(child.get("p_rc_given_rep", parent.get("p_rc_given_rep", global_p_rc_given_rep)), 0.0, 1.0))
+    ssg = cal_sg[(cal_sg["Adj Strategy"].eq(strategy)) & (cal_sg["Grade"].eq(grade))]
+    parent_sg = ssg.iloc[0].to_dict() if len(ssg) else {}
 
-    # parent (strategy) shrunk to global
-    mu_draw_p, sig_draw_p = _blend(
-        parent.get("mu_draw", stats_g_draw["mu"]), parent.get("sig_draw", stats_g_draw["sig"]),
-        parent.get("n_draw", 0), parent.get("n_funds_draw", 0), parent.get("ks_pass_draw", False),
+    ssa = cal_sa[(cal_sa["Adj Strategy"].eq(strategy)) & (cal_sa["AgeBucket"].eq(age_bucket))]
+    parent_sa = ssa.iloc[0].to_dict() if len(ssa) else {}
+
+    # ----- hazards with shrinkage -----
+    p_s = float(np.clip(parent_s.get("p_draw", global_p_draw), 0.0, 1.0))
+    p_sg = float(np.clip(parent_sg.get("p_draw", p_s), 0.0, 1.0))
+    p_sa = float(np.clip(parent_sa.get("p_draw", p_s), 0.0, 1.0))
+    p_draw_parent = _combine_p(p_sg, parent_sg.get("n_obs", 0), parent_sg.get("n_funds", 0),
+                               p_sa, parent_sa.get("n_obs", 0), parent_sa.get("n_funds", 0), p_s)
+    p_draw = _blend_p(child.get("p_draw", p_draw_parent), child.get("n_obs", 0), child.get("n_funds", 0), p_draw_parent)
+
+    p_s = float(np.clip(parent_s.get("p_rep", global_p_rep), 0.0, 1.0))
+    p_sg = float(np.clip(parent_sg.get("p_rep", p_s), 0.0, 1.0))
+    p_sa = float(np.clip(parent_sa.get("p_rep", p_s), 0.0, 1.0))
+    p_rep_parent = _combine_p(p_sg, parent_sg.get("n_obs", 0), parent_sg.get("n_funds", 0),
+                              p_sa, parent_sa.get("n_obs", 0), parent_sa.get("n_funds", 0), p_s)
+    p_rep = _blend_p(child.get("p_rep", p_rep_parent), child.get("n_obs", 0), child.get("n_funds", 0), p_rep_parent)
+
+    p_s = float(np.clip(parent_s.get("p_rc_given_rep", global_p_rc_given_rep), 0.0, 1.0))
+    p_sg = float(np.clip(parent_sg.get("p_rc_given_rep", p_s), 0.0, 1.0))
+    p_sa = float(np.clip(parent_sa.get("p_rc_given_rep", p_s), 0.0, 1.0))
+    # use rep counts as effective sample for rc_given_rep
+    p_rc_parent = _combine_p(p_sg, parent_sg.get("n_rep", 0), parent_sg.get("n_funds_rep", 0),
+                             p_sa, parent_sa.get("n_rep", 0), parent_sa.get("n_funds_rep", 0), p_s)
+    p_rc = _blend_p(child.get("p_rc_given_rep", p_rc_parent), child.get("n_rep", 0), child.get("n_funds_rep", 0), p_rc_parent)
+
+    # ----- sizes with hierarchical shrinkage -----
+    # strategy -> global
+    mu_draw_s, sig_draw_s = _blend(
+        parent_s.get("mu_draw", stats_g_draw["mu"]), parent_s.get("sig_draw", stats_g_draw["sig"]),
+        parent_s.get("n_draw", 0), parent_s.get("n_funds_draw", 0), parent_s.get("ks_pass_draw", False),
         stats_g_draw["mu"], stats_g_draw["sig"], stats_g_draw["n"], stats_g_draw["n_funds"], stats_g_draw["ks_pass"]
     )
-    mu_rep_p, sig_rep_p = _blend(
-        parent.get("mu_rep", stats_g_rep["mu"]), parent.get("sig_rep", stats_g_rep["sig"]),
-        parent.get("n_rep", 0), parent.get("n_funds_rep", 0), parent.get("ks_pass_rep", False),
+    mu_rep_s, sig_rep_s = _blend(
+        parent_s.get("mu_rep", stats_g_rep["mu"]), parent_s.get("sig_rep", stats_g_rep["sig"]),
+        parent_s.get("n_rep", 0), parent_s.get("n_funds_rep", 0), parent_s.get("ks_pass_rep", False),
         stats_g_rep["mu"], stats_g_rep["sig"], stats_g_rep["n"], stats_g_rep["n_funds"], stats_g_rep["ks_pass"]
     )
-    mu_rc_p, sig_rc_p = _blend(
-        parent.get("mu_rc", stats_g_rc["mu"]), parent.get("sig_rc", stats_g_rc["sig"]),
-        parent.get("n_rc", 0), parent.get("n_funds_rc", 0), parent.get("ks_pass_rc", False),
+    mu_rc_s, sig_rc_s = _blend(
+        parent_s.get("mu_rc", stats_g_rc["mu"]), parent_s.get("sig_rc", stats_g_rc["sig"]),
+        parent_s.get("n_rc", 0), parent_s.get("n_funds_rc", 0), parent_s.get("ks_pass_rc", False),
         stats_g_rc["mu"], stats_g_rc["sig"], stats_g_rc["n"], stats_g_rc["n_funds"], stats_g_rc["ks_pass"]
+    )
+
+    # strategy+grade -> strategy
+    mu_draw_sg, sig_draw_sg = _blend(
+        parent_sg.get("mu_draw", mu_draw_s), parent_sg.get("sig_draw", sig_draw_s),
+        parent_sg.get("n_draw", 0), parent_sg.get("n_funds_draw", 0), parent_sg.get("ks_pass_draw", False),
+        mu_draw_s, sig_draw_s, parent_s.get("n_draw", 0), parent_s.get("n_funds_draw", 0), parent_s.get("ks_pass_draw", False)
+    )
+    mu_rep_sg, sig_rep_sg = _blend(
+        parent_sg.get("mu_rep", mu_rep_s), parent_sg.get("sig_rep", sig_rep_s),
+        parent_sg.get("n_rep", 0), parent_sg.get("n_funds_rep", 0), parent_sg.get("ks_pass_rep", False),
+        mu_rep_s, sig_rep_s, parent_s.get("n_rep", 0), parent_s.get("n_funds_rep", 0), parent_s.get("ks_pass_rep", False)
+    )
+    mu_rc_sg, sig_rc_sg = _blend(
+        parent_sg.get("mu_rc", mu_rc_s), parent_sg.get("sig_rc", sig_rc_s),
+        parent_sg.get("n_rc", 0), parent_sg.get("n_funds_rc", 0), parent_sg.get("ks_pass_rc", False),
+        mu_rc_s, sig_rc_s, parent_s.get("n_rc", 0), parent_s.get("n_funds_rc", 0), parent_s.get("ks_pass_rc", False)
+    )
+
+    # strategy+age -> strategy
+    mu_draw_sa, sig_draw_sa = _blend(
+        parent_sa.get("mu_draw", mu_draw_s), parent_sa.get("sig_draw", sig_draw_s),
+        parent_sa.get("n_draw", 0), parent_sa.get("n_funds_draw", 0), parent_sa.get("ks_pass_draw", False),
+        mu_draw_s, sig_draw_s, parent_s.get("n_draw", 0), parent_s.get("n_funds_draw", 0), parent_s.get("ks_pass_draw", False)
+    )
+    mu_rep_sa, sig_rep_sa = _blend(
+        parent_sa.get("mu_rep", mu_rep_s), parent_sa.get("sig_rep", sig_rep_s),
+        parent_sa.get("n_rep", 0), parent_sa.get("n_funds_rep", 0), parent_sa.get("ks_pass_rep", False),
+        mu_rep_s, sig_rep_s, parent_s.get("n_rep", 0), parent_s.get("n_funds_rep", 0), parent_s.get("ks_pass_rep", False)
+    )
+    mu_rc_sa, sig_rc_sa = _blend(
+        parent_sa.get("mu_rc", mu_rc_s), parent_sa.get("sig_rc", sig_rc_s),
+        parent_sa.get("n_rc", 0), parent_sa.get("n_funds_rc", 0), parent_sa.get("ks_pass_rc", False),
+        mu_rc_s, sig_rc_s, parent_s.get("n_rc", 0), parent_s.get("n_funds_rc", 0), parent_s.get("ks_pass_rc", False)
+    )
+
+    # combine sg + sa parents
+    mu_draw_p, sig_draw_p = _combine_mu_sig(
+        mu_draw_sg, sig_draw_sg, parent_sg.get("n_draw", 0), parent_sg.get("n_funds_draw", 0), parent_sg.get("ks_pass_draw", False),
+        mu_draw_sa, sig_draw_sa, parent_sa.get("n_draw", 0), parent_sa.get("n_funds_draw", 0), parent_sa.get("ks_pass_draw", False),
+        mu_draw_s, sig_draw_s
+    )
+    mu_rep_p, sig_rep_p = _combine_mu_sig(
+        mu_rep_sg, sig_rep_sg, parent_sg.get("n_rep", 0), parent_sg.get("n_funds_rep", 0), parent_sg.get("ks_pass_rep", False),
+        mu_rep_sa, sig_rep_sa, parent_sa.get("n_rep", 0), parent_sa.get("n_funds_rep", 0), parent_sa.get("ks_pass_rep", False),
+        mu_rep_s, sig_rep_s
+    )
+    mu_rc_p, sig_rc_p = _combine_mu_sig(
+        mu_rc_sg, sig_rc_sg, parent_sg.get("n_rc", 0), parent_sg.get("n_funds_rc", 0), parent_sg.get("ks_pass_rc", False),
+        mu_rc_sa, sig_rc_sa, parent_sa.get("n_rc", 0), parent_sa.get("n_funds_rc", 0), parent_sa.get("ks_pass_rc", False),
+        mu_rc_s, sig_rc_s
     )
 
     # child shrunk to parent
     mu_draw, sig_draw = _blend(
         child.get("mu_draw", mu_draw_p), child.get("sig_draw", sig_draw_p),
         child.get("n_draw", 0), child.get("n_funds_draw", 0), child.get("ks_pass_draw", False),
-        mu_draw_p, sig_draw_p, parent.get("n_draw", 0), parent.get("n_funds_draw", 0), parent.get("ks_pass_draw", False)
+        mu_draw_p, sig_draw_p, 0, 0, True
     )
     mu_rep, sig_rep = _blend(
         child.get("mu_rep", mu_rep_p), child.get("sig_rep", sig_rep_p),
         child.get("n_rep", 0), child.get("n_funds_rep", 0), child.get("ks_pass_rep", False),
-        mu_rep_p, sig_rep_p, parent.get("n_rep", 0), parent.get("n_funds_rep", 0), parent.get("ks_pass_rep", False)
+        mu_rep_p, sig_rep_p, 0, 0, True
     )
     mu_rc, sig_rc = _blend(
         child.get("mu_rc", mu_rc_p), child.get("sig_rc", sig_rc_p),
         child.get("n_rc", 0), child.get("n_funds_rc", 0), child.get("ks_pass_rc", False),
-        mu_rc_p, sig_rc_p, parent.get("n_rc", 0), parent.get("n_funds_rc", 0), parent.get("ks_pass_rc", False)
+        mu_rc_p, sig_rc_p, 0, 0, True
     )
 
     return {
@@ -963,12 +1180,12 @@ for run_id in range(1, n_runs + 1):
     U_by_q = {}
     for qe in quarters:
         U_by_q[qe] = {
-            "draw_event": one_factor_uniforms(n_funds, rng, RHO_MKT),
-            "draw_size":  one_factor_uniforms(n_funds, rng, RHO_MKT),
-            "rep_event":  one_factor_uniforms(n_funds, rng, RHO_MKT),
-            "rep_size":   one_factor_uniforms(n_funds, rng, RHO_MKT),
-            "rc_event":   one_factor_uniforms(n_funds, rng, RHO_MKT),
-            "rc_size":    one_factor_uniforms(n_funds, rng, RHO_MKT),
+            "draw_event": one_factor_uniforms(n_funds, rng, RHO_EVENT),
+            "draw_size":  one_factor_uniforms(n_funds, rng, RHO_SIZE),
+            "rep_event":  one_factor_uniforms(n_funds, rng, RHO_EVENT),
+            "rep_size":   one_factor_uniforms(n_funds, rng, RHO_SIZE),
+            "rc_event":   one_factor_uniforms(n_funds, rng, RHO_EVENT),
+            "rc_size":    one_factor_uniforms(n_funds, rng, RHO_SIZE),
         }
 
     # Initialize fund state + ledgers (per sim)
@@ -1107,7 +1324,9 @@ for run_id in range(1, n_runs + 1):
                 p_draw_base = float(_sigmoid(Xr @ beta_draw)[0])
             else:
                 p_draw_base = float(params.get("p_draw", 0.0))
-            p_draw_adj = p_draw_base * draw_mult
+            grade_key = grade if grade in GRADE_DRAW_P_MULT else "D"
+            p_draw_adj = p_draw_base * draw_mult * float(GRADE_DRAW_P_MULT.get(grade_key, 1.0))
+            p_draw_adj = min(p_draw_adj, 1.0)
 
             # ---- Drawdown ----
             draw_event = (U["draw_event"][i] < p_draw_adj) and (capacity_pre > 0.0)
@@ -1119,6 +1338,7 @@ for run_id in range(1, n_runs + 1):
             if draw_event:
                 ratio = lognormal_from_u(params["mu_draw"], params["sig_draw"], float(U["draw_size"][i]))
                 ratio = float(np.clip(ratio, 0.0, 1.0))
+                ratio = min(ratio * float(GRADE_DRAW_SIZE_MULT.get(grade_key, 1.0)), 1.0)
                 draw_amt = ratio * capacity_pre
                 cons = ledger.consume_for_drawdown(step, draw_amt)
                 use_rc = cons["use_rc"]
@@ -1143,7 +1363,8 @@ for run_id in range(1, n_runs + 1):
             else:
                 p_rep_base = float(params["p_rep"])
             grade_key = grade if grade in GRADE_P_MULT else "D"
-            p_rep_adj = 1.0 - (1.0 - p_rep_base) ** (1.0 + REP_RAMP_P * tail_factor)
+            runoff_mult = float(runoff_mult_by_strategy.get(strategy, 1.0)) if USE_RUNOFF_CALIBRATION else 1.0
+            p_rep_adj = 1.0 - (1.0 - p_rep_base) ** (1.0 + (REP_RAMP_P * runoff_mult) * tail_factor)
             p_rep_adj = min(1.0, p_rep_adj + REP_RAMP_FLOOR * tail_factor)
             p_rep_adj = min(1.0, p_rep_adj * float(GRADE_P_MULT.get(grade_key, 1.0)))
             # MSCI direct boost on hazard (logit shift)
@@ -1155,7 +1376,7 @@ for run_id in range(1, n_runs + 1):
             if rep_event:
                 rep_ratio = lognormal_from_u(params["mu_rep"], params["sig_rep"], float(U["rep_size"][i]))
                 rep_ratio = float(np.clip(rep_ratio, 0.0, 1.0))
-                rep_ratio = min(rep_ratio * (1.0 + REP_RAMP_SIZE * tail_factor), 1.0)
+                rep_ratio = min(rep_ratio * (1.0 + (REP_RAMP_SIZE * runoff_mult) * tail_factor), 1.0)
                 rep_ratio = min(rep_ratio * float(GRADE_SIZE_MULT.get(grade_key, 1.0)), 1.0)
                 # MSCI direct boost on size
                 size_mult = max(0.0, 1.0 + MSCI_REP_SIZE_BETA * msci_z_eff)
@@ -1376,6 +1597,10 @@ check_out.to_csv(check_csv, index=False)
 check_out.to_parquet(check_pq, index=False)
 print("Saved check:", check_csv)
 print("Saved check:", check_pq)
+
+
+
+
 
 
 
