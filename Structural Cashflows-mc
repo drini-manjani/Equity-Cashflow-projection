@@ -1266,8 +1266,7 @@ for run_id in range(1, n_runs + 1):
         if sim.empty or "FundID" not in sim.columns:
             raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
 
-        print("
-Simulated rows:", len(sim))
+        print("\nSimulated rows:", len(sim))
         print("Simulated funds:", sim["FundID"].nunique())
         if N_SIM > 1:
             print("Structural MC sims:", N_SIM)
@@ -1377,6 +1376,7 @@ check_out.to_csv(check_csv, index=False)
 check_out.to_parquet(check_pq, index=False)
 print("Saved check:", check_csv)
 print("Saved check:", check_pq)
+
 
 
 
