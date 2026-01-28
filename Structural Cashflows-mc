@@ -1,0 +1,1374 @@
+"""
+STRUCTURAL CASHFLOWS — SINGLE PATH (NO MONTE CARLO), ENDOGENOUS NAV
+
+Inputs (from your pipeline):
+- data.parquet (historical panel, for calibrating hazards and size ratios)
+- kmp.parquet/csv (recallable limits; if missing for a fund -> soft limits from data)
+- omega_projection_sota_{year}_{quarter}_{n_q}q.parquet/csv (from NAV Logic)
+    includes: FundID, quarter_end, omega, Adj Strategy, Grade, Fund_Age_Quarters (or AgeBucket)
+- nav_start_sota_{year}_{quarter}.parquet/csv (from NAV Logic)
+    includes: FundID, NAV_start, NAV_start_source, cap_qe, Adj Strategy, Grade, Fund_Age_Quarters
+
+Model:
+- Two-part hazard + lognormal size for:
+    Drawdowns: size ratio to Capacity_Pre
+    Repayments: size ratio to NAV_prev
+    Recallables: conditional on Rep_Regular, ratio to Rep_Regular
+
+- Recallables increase capacity:
+    Capacity_Pre = Remaining_Commitment + RC_Avail_Pre
+  Drawdowns consume recallables FIFO; only remainder reduces Remaining_Commitment.
+
+- NAV is endogenous:
+    NAV_after = max((NAV_prev + Draw_Amount - Rep_Total) * (1 + omega_t), 0)
+
+- Terminal condition:
+    Fully endogenous runoff: repayment probability/size ramp up as cap_qe approaches.
+    No forced terminal liquidation; residual NAV may remain if repayments are insufficient.
+
+Copula:
+- Single-factor Gaussian copula across funds within each quarter.
+- Separate copula draws per component: draw_event, draw_size, rep_event, rep_size, rc_event, rc_size.
+
+Outputs:
+- structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.(csv|parquet)
+"""
+
+import os
+import glob
+import time
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+from math import erf, sqrt
+
+t0 = time.perf_counter()
+
+# =============================
+# User inputs / paths
+# =============================
+year = int(input("Enter year (e.g. 2025): ").strip())
+quarter = input("Enter quarter (Q1, Q2, Q3, Q4): ").strip().upper()
+
+n_q = int(input("Enter number of quarters to simulate (0 => default 40): ").strip() or "0")
+if n_q == 0:
+    n_q = 40
+
+RHO_MKT = float(input("Single-factor copula correlation rho_mkt [0.25]: ").strip() or "0.25")
+RHO_MKT = float(np.clip(RHO_MKT, 0.0, 0.999))
+
+SEED = int(input("Random seed [1234]: ").strip() or "1234")
+
+N_SIM = int(input("Structural MC sims (0 => default 1000): ").strip() or "0")
+if N_SIM <= 0:
+    N_SIM = 1000
+
+BASE_DIR = os.path.join("C:\\Users", os.environ.get("USERNAME"), "Documents", "Equity")
+HOME = os.path.join(BASE_DIR, f"{year}_{quarter}")
+DATA_DIR = os.path.join(HOME, "data")
+
+data_path = os.path.join(DATA_DIR, "data.parquet")
+kmp_path_parquet = os.path.join(DATA_DIR, "kmp.parquet")
+kmp_path_csv = os.path.join(DATA_DIR, "kmp.csv")
+
+if not os.path.exists(data_path):
+    raise FileNotFoundError(f"Missing {data_path}")
+if not (os.path.exists(kmp_path_parquet) or os.path.exists(kmp_path_csv)):
+    raise FileNotFoundError("Missing kmp.parquet or kmp.csv in DATA_DIR")
+
+print("HOME:", HOME)
+print("DATA_DIR:", DATA_DIR)
+
+# =============================
+# Config
+# =============================
+AGE_BINS_Q = [-1, 7, 15, 23, 31, 39, 59, 79, 10_000]
+AGE_LABELS = ["0-2y","2-4y","4-6y","6-8y","8-10y","10-15y","15-20y","20y+"]
+
+NAV_EPS = 100.0         # repayment sizing requires NAV_prev > NAV_EPS
+NAV_STOP_EPS = 1.0      # if NAV <= this, stop fund
+CAP_EPS = 1.0
+
+# end-of-life repayment ramp (fully endogenous)
+RUNOFF_Q = 12            # quarters before cap_qe to start ramp
+REP_RAMP_P = 2.0         # strength for repayment probability ramp
+REP_RAMP_SIZE = 1.0      # strength for repayment size ramp
+REP_RAMP_FLOOR = 0.05    # minimum repayment prob added in tail
+
+# investment period / drawdown shape controls
+IP_YEARS_DEFAULT = 5
+IP_Q_DEFAULT = int(IP_YEARS_DEFAULT * 4)
+IP_CUM_PCTL = 0.80
+IP_Q_MIN = 4
+IP_Q_MAX = 40
+DRAW_AGE_MIN_MULT = 0.2
+DRAW_AGE_DECAY_POWER = 1.0
+
+# drawdown timing controls
+ENFORCE_IP_LIMITS = False  # hard stop + forced call at IP end
+USE_DRAW_AGE_SHAPE = False  # optional age decay multiplier (soft shape)
+
+# grade monotonicity controls (A better than B, etc.)
+GRADE_P_MULT = {"A": 1.15, "B": 1.00, "C": 0.85, "D": 0.70}
+GRADE_SIZE_MULT = {"A": 1.10, "B": 1.00, "C": 0.90, "D": 0.80}
+
+# MSCI direct sensitivity (repayment hazard/size)
+MSCI_REP_P_BETA = 0.6     # logit shift per 1 std of MSCI
+MSCI_REP_SIZE_BETA = 0.4  # size multiplier per 1 std of MSCI
+MSCI_Z_CLIP = 2.0
+MSCI_REP_POS_ONLY = True  # only boost in bullish periods
+
+SIGMA_FLOOR = 0.35
+SIGMA_CAP = 2.0
+
+# lognormal validation / shrinkage
+MIN_LN_OBS = 30
+MIN_LN_FUNDS = 5
+KS_ALPHA = 0.05
+SHRINK_N = 100
+SHRINK_FUNDS = 10
+
+# hazard model (logit) controls
+USE_HAZARD_MODELS = True
+LOGIT_L2 = 1.0
+LOGIT_MAX_ITER = 50
+LOGIT_TOL = 1e-6
+
+SOFT_RHO_PCTL = 0.95
+SOFT_EXPIRY_FALLBACK = 20
+
+GRADE_STATES = ["A","B","C","D"]
+
+# =============================
+# Helpers
+# =============================
+def make_age_bucket_q(age_q: float):
+    return pd.cut(pd.Series([age_q]), bins=AGE_BINS_Q, labels=AGE_LABELS).iloc[0]
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+def one_factor_uniforms(n: int, rng: np.random.Generator, rho_mkt: float) -> np.ndarray:
+    rho_mkt = float(np.clip(rho_mkt, 0.0, 0.999))
+    Z = rng.standard_normal()
+    eps = rng.standard_normal(n)
+    X = np.sqrt(rho_mkt) * Z + np.sqrt(1.0 - rho_mkt) * eps
+    return np.array([norm_cdf(x) for x in X], dtype=float)
+
+def inv_norm(u: float) -> float:
+    # Prefer scipy if available
+    try:
+        from scipy.special import erfinv
+        return sqrt(2.0) * float(erfinv(2.0*u - 1.0))
+    except Exception:
+        # fallback approximation (deterministic-ish)
+        u = float(np.clip(u, 1e-6, 1.0 - 1e-6))
+        return float(np.sign(u - 0.5) * np.sqrt(2.0) * np.sqrt(abs(np.log(1.0 - 2.0*abs(u-0.5)))))
+
+def lognormal_from_u(mu: float, sigma: float, u: float) -> float:
+    z = inv_norm(u)
+    return float(np.exp(mu + sigma * z))
+
+# =============================
+# Recallable ledger
+# =============================
+@dataclass
+class RecallableBucket:
+    created_q: int
+    expiry_q: int
+    amount_remaining: float
+
+@dataclass
+class RecallableLedger:
+    rho: float
+    expiry_quarters: int
+    commitment: float
+    buckets: List[RecallableBucket] = field(default_factory=list)
+
+    def _rc_cap(self) -> float:
+        return max(float(self.rho), 0.0) * max(float(self.commitment), 0.0)
+
+    def drop_expired(self, q: int) -> None:
+        if int(self.expiry_quarters) <= 0:
+            self.buckets = []
+            return
+        self.buckets = [b for b in self.buckets if b.expiry_q >= q and b.amount_remaining > 0]
+
+    def available(self, q: int) -> float:
+        self.drop_expired(q)
+        return float(sum(b.amount_remaining for b in self.buckets))
+
+    def add_recallable(self, q: int, rc_amount: float, enforce_cap: bool = True) -> float:
+        self.drop_expired(q)
+        x = max(float(rc_amount or 0.0), 0.0)
+        if x <= 0.0 or int(self.expiry_quarters) <= 0:
+            return 0.0
+
+        add_amt = x
+        if enforce_cap:
+            cap = self._rc_cap()
+            cur = self.available(q)
+            room = max(cap - cur, 0.0)
+            add_amt = min(add_amt, room)
+
+        if add_amt <= 0.0:
+            return 0.0
+
+        self.buckets.append(RecallableBucket(
+            created_q=q,
+            expiry_q=q + int(self.expiry_quarters),
+            amount_remaining=float(add_amt)
+        ))
+        return float(add_amt)
+
+    def consume_for_drawdown(self, q: int, draw_amount: float) -> Dict[str, float]:
+        self.drop_expired(q)
+        need = max(float(draw_amount or 0.0), 0.0)
+        if need <= 0.0:
+            return {"use_rc": 0.0, "use_commitment": 0.0}
+
+        self.buckets.sort(key=lambda b: b.created_q)  # FIFO
+
+        use_rc = 0.0
+        for b in self.buckets:
+            if need <= 0:
+                break
+            take = min(b.amount_remaining, need)
+            b.amount_remaining -= take
+            need -= take
+            use_rc += take
+
+        self.buckets = [b for b in self.buckets if b.amount_remaining > 0]
+        use_commitment = max(float(draw_amount) - use_rc, 0.0)
+        return {"use_rc": float(use_rc), "use_commitment": float(use_commitment)}
+
+# =============================
+# Load historical data for calibration
+# =============================
+data = pd.read_parquet(data_path).copy()
+
+# Required columns for calibration
+req = [
+    "FundID","Adj Strategy","Grade","Fund_Age_Quarters",
+    "Year of Transaction Date","Quarter of Transaction Date",
+    "Commitment EUR","Adj Drawdown EUR","Adj Repayment EUR","NAV Adjusted EUR","Recallable"
+]
+missing = [c for c in req if c not in data.columns]
+if missing:
+    raise ValueError(f"Missing in data.parquet: {missing}")
+
+for c in ["Commitment EUR","Adj Drawdown EUR","Adj Repayment EUR","NAV Adjusted EUR","Recallable","Fund_Age_Quarters"]:
+    data[c] = pd.to_numeric(data[c], errors="coerce")
+
+data["Adj Drawdown EUR"] = data["Adj Drawdown EUR"].fillna(0.0).clip(lower=0.0)
+data["Adj Repayment EUR"] = data["Adj Repayment EUR"].fillna(0.0).clip(lower=0.0)
+data["Recallable"] = data["Recallable"].fillna(0.0).clip(lower=0.0)
+data["NAV Adjusted EUR"] = data["NAV Adjusted EUR"].fillna(0.0).clip(lower=0.0)
+data["Fund_Age_Quarters"] = data["Fund_Age_Quarters"].fillna(0.0)
+
+# quarter_end + ordering
+data["quarter_end"] = pd.PeriodIndex(
+    data["Year of Transaction Date"].astype(int).astype(str) + "Q" +
+    data["Quarter of Transaction Date"].astype(int).astype(str),
+    freq="Q"
+).to_timestamp("Q")
+data["quarter_end"] = pd.to_datetime(data["quarter_end"])
+
+data = data.sort_values(["FundID","quarter_end"]).reset_index(drop=True)
+
+# commitment level proxy (flow->cum)
+data["Commitment_Level"] = data.groupby("FundID")["Commitment EUR"].cumsum().fillna(0.0)
+
+# commitment per fund (use cumulative commitment level if available)
+if "Commitment_Level" in data.columns:
+    fund_commit = data.groupby("FundID")["Commitment_Level"].max().fillna(0.0).to_dict()
+else:
+    fund_commit = data.groupby("FundID")["Commitment EUR"].max().fillna(0.0).to_dict()
+
+# -----------------------------
+# Calibrate investment period by strategy (based on drawdown mass)
+# -----------------------------
+ip_by_strategy = {}
+df_ip = data.copy()
+df_ip = df_ip[(df_ip["Adj Drawdown EUR"] > 0) & df_ip["Adj Strategy"].notna() & df_ip["Fund_Age_Quarters"].notna()]
+if len(df_ip):
+    df_ip["age_q"] = pd.to_numeric(df_ip["Fund_Age_Quarters"], errors="coerce").round().astype("Int64")
+    df_ip = df_ip[df_ip["age_q"].notna() & (df_ip["age_q"] >= 0)]
+    for strat, g in df_ip.groupby("Adj Strategy", dropna=False):
+        s = g.groupby("age_q")["Adj Drawdown EUR"].sum().sort_index()
+        total = float(s.sum())
+        if total <= 0:
+            continue
+        cum = s.cumsum()
+        thr = IP_CUM_PCTL * total
+        # first age where cumulative drawdowns reach threshold
+        ip_q = int(cum.index[cum.values >= thr][0])
+        ip_q = int(np.clip(ip_q, IP_Q_MIN, IP_Q_MAX))
+        ip_by_strategy[strat] = ip_q
+print("IP_Q by strategy (drawdown %):", ip_by_strategy)
+
+# NAV lag for repayment ratio calibration
+data["nav_prev"] = data.groupby("FundID")["NAV Adjusted EUR"].shift(1)
+
+# age bucket
+data["AgeBucket"] = pd.cut(data["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+
+# capacity proxy for draw ratio calibration
+CAP_PROXY_COL = "Capacity" if "Capacity" in data.columns else None
+if CAP_PROXY_COL is None:
+    print("WARNING: data.parquet has no 'Capacity' column; draw calibration uses Commitment_Level proxy.")
+data["cap_proxy"] = pd.to_numeric(data[CAP_PROXY_COL], errors="coerce").fillna(0.0) if CAP_PROXY_COL else data["Commitment_Level"].fillna(0.0)
+
+# event flags + ratios
+data["draw_event"] = (data["Adj Drawdown EUR"] > 0).astype(int)
+data["rep_event"]  = (data["Adj Repayment EUR"] > 0).astype(int)
+
+data["draw_ratio"] = np.where(data["cap_proxy"] > CAP_EPS, data["Adj Drawdown EUR"] / data["cap_proxy"], np.nan)
+data.loc[data["draw_ratio"] <= 0, "draw_ratio"] = np.nan
+
+data["rep_ratio"] = np.where(data["nav_prev"].abs() > NAV_EPS, data["Adj Repayment EUR"] / data["nav_prev"].abs(), np.nan)
+data.loc[data["rep_ratio"] <= 0, "rep_ratio"] = np.nan
+
+data["rc_given_rep_event"] = ((data["Adj Repayment EUR"] > 0) & (data["Recallable"] > 0)).astype(int)
+data["rc_ratio_given_rep"] = np.where(data["Adj Repayment EUR"] > 0, data["Recallable"] / data["Adj Repayment EUR"], np.nan)
+data.loc[data["rc_ratio_given_rep"] <= 0, "rc_ratio_given_rep"] = np.nan
+
+# -----------------------------
+# Hazard model (logit) helpers
+# -----------------------------
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def build_feature_matrix(df: pd.DataFrame, include_nav: bool) -> pd.DataFrame:
+    d = df.copy()
+    d["Adj Strategy"] = d["Adj Strategy"].fillna("Unknown")
+    d["Grade"] = d["Grade"].fillna("D").astype(str).str.strip()
+
+    X = pd.DataFrame(index=d.index)
+    X["intercept"] = 1.0
+    X["age_q"] = d["age_q"].astype(float)
+    X["age_q2"] = (d["age_q"].astype(float) ** 2)
+    if include_nav:
+        X["log_nav_prev"] = d["log_nav_prev"].astype(float)
+
+    strat_d = pd.get_dummies(d["Adj Strategy"], prefix="strat", drop_first=True)
+    grade_d = pd.get_dummies(d["Grade"], prefix="grade", drop_first=True)
+
+    X = pd.concat([X, strat_d, grade_d], axis=1)
+    return X
+
+
+def standardize_X(X: pd.DataFrame, cont_cols: list) -> Tuple[pd.DataFrame, dict, dict]:
+    means = {}
+    stds = {}
+    X = X.copy()
+    for c in cont_cols:
+        if c in X.columns:
+            mu = float(X[c].mean())
+            sd = float(X[c].std(ddof=1)) if len(X) > 1 else 1.0
+            if not np.isfinite(sd) or sd <= 0:
+                sd = 1.0
+            means[c] = mu
+            stds[c] = sd
+            X[c] = (X[c] - mu) / sd
+    return X, means, stds
+
+
+def apply_standardize(X: pd.DataFrame, means: dict, stds: dict) -> pd.DataFrame:
+    X = X.copy()
+    for c, mu in means.items():
+        if c in X.columns:
+            sd = stds.get(c, 1.0)
+            if not np.isfinite(sd) or sd <= 0:
+                sd = 1.0
+            X[c] = (X[c] - mu) / sd
+    return X
+
+
+def fit_logit(X: np.ndarray, y: np.ndarray, l2: float = LOGIT_L2, max_iter: int = LOGIT_MAX_ITER, tol: float = LOGIT_TOL) -> np.ndarray:
+    n, p = X.shape
+    beta = np.zeros(p, dtype=float)
+    I = np.eye(p)
+    for _ in range(max_iter):
+        z = X @ beta
+        p_hat = _sigmoid(z)
+        W = p_hat * (1.0 - p_hat)
+        W = np.clip(W, 1e-6, None)
+        # IRLS
+        z_adj = z + (y - p_hat) / W
+        XTW = X.T * W
+        A = XTW @ X + l2 * I
+        b = XTW @ z_adj
+        try:
+            beta_new = np.linalg.solve(A, b)
+        except Exception:
+            beta_new = np.linalg.lstsq(A, b, rcond=None)[0]
+        if np.linalg.norm(beta_new - beta) < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+    return beta
+
+
+def build_feature_row(strategy: str, grade: str, age_q: int, log_nav_prev: float, include_nav: bool,
+                      cols: list, means: dict, stds: dict) -> np.ndarray:
+    row = {
+        "Adj Strategy": strategy,
+        "Grade": grade,
+        "age_q": float(age_q),
+        "age_q2": float(age_q) ** 2,
+        "log_nav_prev": float(log_nav_prev) if include_nav else 0.0,
+    }
+    df = pd.DataFrame([row])
+    X = build_feature_matrix(df, include_nav=include_nav)
+    X = X.reindex(columns=cols, fill_value=0.0)
+    X = apply_standardize(X, means, stds)
+    return X.to_numpy(dtype=float)
+
+def ks_test_normal(log_x: np.ndarray, alpha: float = KS_ALPHA) -> Tuple[float, bool]:
+    n = len(log_x)
+    if n < 2:
+        return float('nan'), False
+    mu = float(np.mean(log_x))
+    sig = float(np.std(log_x, ddof=1)) if n > 1 else 0.0
+    if not np.isfinite(sig) or sig <= 0:
+        return float('nan'), False
+
+    x = np.sort(log_x)
+    # Normal CDF with fitted mu/sigma
+    z = (x - mu) / (sig * np.sqrt(2.0))
+    try:
+        F = 0.5 * (1.0 + np.erf(z))
+    except Exception:
+        F = 0.5 * (1.0 + np.vectorize(erf)(z))
+    i = np.arange(1, n + 1)
+    d_plus = np.max(i / n - F)
+    d_minus = np.max(F - (i - 1) / n)
+    D = float(max(d_plus, d_minus))
+
+    # KS critical value (approx) for alpha
+    dcrit = float(np.sqrt(-0.5 * np.log(alpha / 2.0) / n))
+    return D, bool(D <= dcrit)
+
+
+def fit_lognormal_stats(x: pd.Series, fund_ids: pd.Series) -> Dict[str, float]:
+    g = x.dropna()
+    g = g[g > 0]
+    n_obs = int(len(g))
+    if n_obs == 0:
+        return {
+            "mu": 0.0, "sig": SIGMA_FLOOR,
+            "n": 0, "n_funds": 0,
+            "ks_D": float('nan'), "ks_pass": False,
+        }
+
+    # fund count
+    n_funds = int(fund_ids.loc[g.index].nunique()) if fund_ids is not None else 0
+
+    lx = np.log(g.to_numpy(dtype=float))
+    mu = float(np.mean(lx))
+    sig = float(np.std(lx, ddof=1)) if n_obs > 1 else SIGMA_FLOOR
+    sig = float(np.clip(max(sig, SIGMA_FLOOR), SIGMA_FLOOR, SIGMA_CAP))
+
+    ks_D, ks_pass = (float('nan'), False)
+    if n_obs >= MIN_LN_OBS and n_funds >= MIN_LN_FUNDS:
+        ks_D, ks_pass = ks_test_normal(lx, alpha=KS_ALPHA)
+
+    return {
+        "mu": mu, "sig": sig,
+        "n": n_obs, "n_funds": n_funds,
+        "ks_D": ks_D, "ks_pass": ks_pass,
+    }
+
+# -----------------------------
+# HAZARD MODEL CALIBRATION (logit)
+# -----------------------------
+# Build hazard dataset
+haz = data.copy()
+haz["age_q"] = pd.to_numeric(haz["Fund_Age_Quarters"], errors="coerce").round()
+haz = haz[haz["age_q"].notna()].copy()
+haz["age_q"] = haz["age_q"].astype(int)
+haz["log_nav_prev"] = np.log1p(haz["nav_prev"].abs().fillna(0.0))
+
+# apply IP gate to drawdown hazard calibration
+haz["ip_q"] = haz["Adj Strategy"].map(ip_by_strategy).fillna(IP_Q_DEFAULT).astype(int)
+draw_haz = haz.copy()
+if ENFORCE_IP_LIMITS:
+    draw_haz = haz[haz["age_q"] <= haz["ip_q"]].copy()
+
+# features
+X_draw = build_feature_matrix(draw_haz, include_nav=False)
+X_rep = build_feature_matrix(haz, include_nav=True)
+
+cont_draw = ["age_q", "age_q2"]
+cont_rep = ["age_q", "age_q2", "log_nav_prev"]
+
+X_draw, draw_means, draw_stds = standardize_X(X_draw, cont_draw)
+X_rep, rep_means, rep_stds = standardize_X(X_rep, cont_rep)
+
+# targets
+Y_draw = draw_haz["draw_event"].to_numpy(dtype=float)
+Y_rep = haz["rep_event"].to_numpy(dtype=float)
+
+beta_draw = None
+beta_rep = None
+
+try:
+    if USE_HAZARD_MODELS and len(X_draw) and len(Y_draw):
+        beta_draw = fit_logit(X_draw.to_numpy(), Y_draw)
+    if USE_HAZARD_MODELS and len(X_rep) and len(Y_rep):
+        beta_rep = fit_logit(X_rep.to_numpy(), Y_rep)
+except Exception as e:
+    print("Warning: hazard model fit failed, falling back to group means:", e)
+    beta_draw = None
+    beta_rep = None
+
+hazard_meta = {
+    "draw_cols": list(X_draw.columns),
+    "rep_cols": list(X_rep.columns),
+    "draw_means": draw_means, "draw_stds": draw_stds,
+    "rep_means": rep_means, "rep_stds": rep_stds,
+}
+
+# build calibration tables
+group_keys = ["Adj Strategy","Grade","AgeBucket"]
+
+rows = []
+for (s,g,a), grp in data.groupby(group_keys, dropna=False):
+    p_draw = float(grp["draw_event"].mean()) if len(grp) else 0.0
+    p_rep  = float(grp["rep_event"].mean()) if len(grp) else 0.0
+
+    rep_q = grp[grp["Adj Repayment EUR"] > 0]
+    p_rc_given_rep = float(rep_q["rc_given_rep_event"].mean()) if len(rep_q) else 0.0
+
+    stats_d = fit_lognormal_stats(grp["draw_ratio"], grp["FundID"])
+    stats_r = fit_lognormal_stats(grp["rep_ratio"], grp["FundID"])
+    stats_c = fit_lognormal_stats(rep_q["rc_ratio_given_rep"], rep_q["FundID"]) if len(rep_q) else {
+        "mu": 0.0, "sig": SIGMA_FLOOR, "n": 0, "n_funds": 0, "ks_D": float('nan'), "ks_pass": False,
+    }
+
+    rows.append({
+        "Adj Strategy": s, "Grade": g, "AgeBucket": a,
+        "p_draw": p_draw, "p_rep": p_rep, "p_rc_given_rep": p_rc_given_rep,
+        "mu_draw": stats_d["mu"], "sig_draw": stats_d["sig"],
+        "n_draw": stats_d["n"], "n_funds_draw": stats_d["n_funds"], "ks_draw": stats_d["ks_D"], "ks_pass_draw": stats_d["ks_pass"],
+        "mu_rep": stats_r["mu"], "sig_rep": stats_r["sig"],
+        "n_rep": stats_r["n"], "n_funds_rep": stats_r["n_funds"], "ks_rep": stats_r["ks_D"], "ks_pass_rep": stats_r["ks_pass"],
+        "mu_rc": stats_c["mu"], "sig_rc": stats_c["sig"],
+        "n_rc": stats_c["n"], "n_funds_rc": stats_c["n_funds"], "ks_rc": stats_c["ks_D"], "ks_pass_rc": stats_c["ks_pass"],
+        "n_obs": int(len(grp))
+    })
+cal = pd.DataFrame(rows)
+
+# strategy fallback
+rows_s = []
+for s, grp in data.groupby(["Adj Strategy"], dropna=False):
+    p_draw = float(grp["draw_event"].mean()) if len(grp) else 0.0
+    p_rep  = float(grp["rep_event"].mean()) if len(grp) else 0.0
+
+    rep_q = grp[grp["Adj Repayment EUR"] > 0]
+    p_rc_given_rep = float(rep_q["rc_given_rep_event"].mean()) if len(rep_q) else 0.0
+
+    stats_d = fit_lognormal_stats(grp["draw_ratio"], grp["FundID"])
+    stats_r = fit_lognormal_stats(grp["rep_ratio"], grp["FundID"])
+    stats_c = fit_lognormal_stats(rep_q["rc_ratio_given_rep"], rep_q["FundID"]) if len(rep_q) else {
+        "mu": 0.0, "sig": SIGMA_FLOOR, "n": 0, "n_funds": 0, "ks_D": float('nan'), "ks_pass": False,
+    }
+
+    rows_s.append({
+        "Adj Strategy": s,
+        "p_draw": p_draw, "p_rep": p_rep, "p_rc_given_rep": p_rc_given_rep,
+        "mu_draw": stats_d["mu"], "sig_draw": stats_d["sig"],
+        "n_draw": stats_d["n"], "n_funds_draw": stats_d["n_funds"], "ks_draw": stats_d["ks_D"], "ks_pass_draw": stats_d["ks_pass"],
+        "mu_rep": stats_r["mu"], "sig_rep": stats_r["sig"],
+        "n_rep": stats_r["n"], "n_funds_rep": stats_r["n_funds"], "ks_rep": stats_r["ks_D"], "ks_pass_rep": stats_r["ks_pass"],
+        "mu_rc": stats_c["mu"], "sig_rc": stats_c["sig"],
+        "n_rc": stats_c["n"], "n_funds_rc": stats_c["n_funds"], "ks_rc": stats_c["ks_D"], "ks_pass_rc": stats_c["ks_pass"],
+    })
+cal_s = pd.DataFrame(rows_s)
+
+# global fallback
+global_p_draw = float(data["draw_event"].mean())
+global_p_rep  = float(data["rep_event"].mean())
+rep_all = data[data["Adj Repayment EUR"] > 0]
+global_p_rc_given_rep = float(rep_all["rc_given_rep_event"].mean()) if len(rep_all) else 0.0
+
+stats_g_draw = fit_lognormal_stats(data["draw_ratio"], data["FundID"])
+stats_g_rep  = fit_lognormal_stats(data["rep_ratio"], data["FundID"])
+stats_g_rc   = fit_lognormal_stats(rep_all["rc_ratio_given_rep"], rep_all["FundID"]) if len(rep_all) else {
+    "mu": 0.0, "sig": SIGMA_FLOOR, "n": 0, "n_funds": 0, "ks_D": float('nan'), "ks_pass": False,
+}
+
+# shrinkage helpers
+def _weight(n_obs: float, n_funds: float, ks_pass: bool) -> float:
+    if not ks_pass:
+        return 0.0
+    if n_obs is None or n_obs <= 0 or n_funds is None or n_funds <= 0:
+        return 0.0
+    w = (n_obs / (n_obs + SHRINK_N)) * (n_funds / (n_funds + SHRINK_FUNDS))
+    return float(np.clip(w, 0.0, 1.0))
+
+def _blend(mu_c, sig_c, n_c, nf_c, ks_c, mu_p, sig_p, n_p, nf_p, ks_p):
+    w = _weight(n_c, nf_c, ks_c)
+    mu = w * float(mu_c) + (1.0 - w) * float(mu_p)
+    sig = w * float(sig_c) + (1.0 - w) * float(sig_p)
+    sig = float(np.clip(max(sig, SIGMA_FLOOR), SIGMA_FLOOR, SIGMA_CAP))
+    return mu, sig
+
+
+# -----------------------------
+# Diagnostics table for lognormal fits + shrinkage weights
+# -----------------------------
+cal_s_map = {row["Adj Strategy"]: row for _, row in cal_s.iterrows()} if len(cal_s) else {}
+
+diag_rows = []
+for _, row in cal.iterrows():
+    strat = row["Adj Strategy"]
+    parent = cal_s_map.get(strat, {})
+
+    w_draw_child = _weight(row.get("n_draw", 0), row.get("n_funds_draw", 0), row.get("ks_pass_draw", False))
+    w_rep_child  = _weight(row.get("n_rep", 0), row.get("n_funds_rep", 0), row.get("ks_pass_rep", False))
+    w_rc_child   = _weight(row.get("n_rc", 0), row.get("n_funds_rc", 0), row.get("ks_pass_rc", False))
+
+    w_draw_parent = _weight(parent.get("n_draw", 0), parent.get("n_funds_draw", 0), parent.get("ks_pass_draw", False))
+    w_rep_parent  = _weight(parent.get("n_rep", 0), parent.get("n_funds_rep", 0), parent.get("ks_pass_rep", False))
+    w_rc_parent   = _weight(parent.get("n_rc", 0), parent.get("n_funds_rc", 0), parent.get("ks_pass_rc", False))
+
+    diag_rows.append({
+        "Adj Strategy": strat,
+        "Grade": row.get("Grade"),
+        "AgeBucket": row.get("AgeBucket"),
+
+        "n_draw": row.get("n_draw", 0),
+        "n_funds_draw": row.get("n_funds_draw", 0),
+        "ks_draw": row.get("ks_draw"),
+        "ks_pass_draw": row.get("ks_pass_draw", False),
+        "w_draw_child": w_draw_child,
+        "w_draw_parent": w_draw_parent,
+
+        "n_rep": row.get("n_rep", 0),
+        "n_funds_rep": row.get("n_funds_rep", 0),
+        "ks_rep": row.get("ks_rep"),
+        "ks_pass_rep": row.get("ks_pass_rep", False),
+        "w_rep_child": w_rep_child,
+        "w_rep_parent": w_rep_parent,
+
+        "n_rc": row.get("n_rc", 0),
+        "n_funds_rc": row.get("n_funds_rc", 0),
+        "ks_rc": row.get("ks_rc"),
+        "ks_pass_rc": row.get("ks_pass_rc", False),
+        "w_rc_child": w_rc_child,
+        "w_rc_parent": w_rc_parent,
+    })
+
+diag = pd.DataFrame(diag_rows)
+
+try:
+    diag_csv = os.path.join(DATA_DIR, "cal_lognormal_diagnostics.csv")
+    diag_pq  = os.path.join(DATA_DIR, "cal_lognormal_diagnostics.parquet")
+    diag.to_csv(diag_csv, index=False)
+    diag.to_parquet(diag_pq, index=False)
+    print("Saved diagnostics:")
+    print(diag_csv)
+    print(diag_pq)
+except Exception as e:
+    print("Warning: could not save diagnostics:", e)
+
+def lookup_params(strategy, grade, age_bucket) -> Dict[str, float]:
+    m = (cal["Adj Strategy"].eq(strategy)) & (cal["Grade"].eq(grade)) & (cal["AgeBucket"].eq(age_bucket))
+    child = cal[m].iloc[0].to_dict() if m.any() else {}
+
+    ss = cal_s[cal_s["Adj Strategy"].eq(strategy)]
+    parent = ss.iloc[0].to_dict() if len(ss) else {}
+
+    # hazards (no shrinkage)
+    p_draw = float(np.clip(child.get("p_draw", parent.get("p_draw", global_p_draw)), 0.0, 1.0))
+    p_rep  = float(np.clip(child.get("p_rep", parent.get("p_rep", global_p_rep)), 0.0, 1.0))
+    p_rc   = float(np.clip(child.get("p_rc_given_rep", parent.get("p_rc_given_rep", global_p_rc_given_rep)), 0.0, 1.0))
+
+    # parent (strategy) shrunk to global
+    mu_draw_p, sig_draw_p = _blend(
+        parent.get("mu_draw", stats_g_draw["mu"]), parent.get("sig_draw", stats_g_draw["sig"]),
+        parent.get("n_draw", 0), parent.get("n_funds_draw", 0), parent.get("ks_pass_draw", False),
+        stats_g_draw["mu"], stats_g_draw["sig"], stats_g_draw["n"], stats_g_draw["n_funds"], stats_g_draw["ks_pass"]
+    )
+    mu_rep_p, sig_rep_p = _blend(
+        parent.get("mu_rep", stats_g_rep["mu"]), parent.get("sig_rep", stats_g_rep["sig"]),
+        parent.get("n_rep", 0), parent.get("n_funds_rep", 0), parent.get("ks_pass_rep", False),
+        stats_g_rep["mu"], stats_g_rep["sig"], stats_g_rep["n"], stats_g_rep["n_funds"], stats_g_rep["ks_pass"]
+    )
+    mu_rc_p, sig_rc_p = _blend(
+        parent.get("mu_rc", stats_g_rc["mu"]), parent.get("sig_rc", stats_g_rc["sig"]),
+        parent.get("n_rc", 0), parent.get("n_funds_rc", 0), parent.get("ks_pass_rc", False),
+        stats_g_rc["mu"], stats_g_rc["sig"], stats_g_rc["n"], stats_g_rc["n_funds"], stats_g_rc["ks_pass"]
+    )
+
+    # child shrunk to parent
+    mu_draw, sig_draw = _blend(
+        child.get("mu_draw", mu_draw_p), child.get("sig_draw", sig_draw_p),
+        child.get("n_draw", 0), child.get("n_funds_draw", 0), child.get("ks_pass_draw", False),
+        mu_draw_p, sig_draw_p, parent.get("n_draw", 0), parent.get("n_funds_draw", 0), parent.get("ks_pass_draw", False)
+    )
+    mu_rep, sig_rep = _blend(
+        child.get("mu_rep", mu_rep_p), child.get("sig_rep", sig_rep_p),
+        child.get("n_rep", 0), child.get("n_funds_rep", 0), child.get("ks_pass_rep", False),
+        mu_rep_p, sig_rep_p, parent.get("n_rep", 0), parent.get("n_funds_rep", 0), parent.get("ks_pass_rep", False)
+    )
+    mu_rc, sig_rc = _blend(
+        child.get("mu_rc", mu_rc_p), child.get("sig_rc", sig_rc_p),
+        child.get("n_rc", 0), child.get("n_funds_rc", 0), child.get("ks_pass_rc", False),
+        mu_rc_p, sig_rc_p, parent.get("n_rc", 0), parent.get("n_funds_rc", 0), parent.get("ks_pass_rc", False)
+    )
+
+    return {
+        "p_draw": p_draw,
+        "p_rep": p_rep,
+        "p_rc_given_rep": p_rc,
+        "mu_draw": float(mu_draw), "sig_draw": float(sig_draw),
+        "mu_rep": float(mu_rep), "sig_rep": float(sig_rep),
+        "mu_rc": float(mu_rc), "sig_rc": float(sig_rc),
+    }
+
+# =============================
+# Load KMP and build soft limits (same as before)
+# =============================
+kmp = pd.read_parquet(kmp_path_parquet).copy() if os.path.exists(kmp_path_parquet) else pd.read_csv(kmp_path_csv).copy()
+kmp_needed = ["FundID","Recallable_Percentage_Decimal","Expiration_Quarters"]
+missing_k = [c for c in kmp_needed if c not in kmp.columns]
+if missing_k:
+    raise ValueError(f"Missing columns in kmp: {missing_k}")
+
+kmp2 = kmp[kmp_needed].copy()
+kmp2["Recallable_Percentage_Decimal"] = pd.to_numeric(kmp2["Recallable_Percentage_Decimal"], errors="coerce")
+kmp2["Expiration_Quarters"] = pd.to_numeric(kmp2["Expiration_Quarters"], errors="coerce")
+kmp2 = kmp2.set_index("FundID")
+
+# empirical rho per fund
+tmp_rho = (
+    data.groupby("FundID", as_index=False)
+        .agg(sum_rc=("Recallable","sum"), C_last=("Commitment_Level","max"))
+)
+tmp_rho["rho_emp"] = np.where(tmp_rho["C_last"] > 0, tmp_rho["sum_rc"] / tmp_rho["C_last"], np.nan)
+tmp_rho = tmp_rho.merge(
+    data.sort_values(["FundID","quarter_end"]).groupby("FundID").tail(1)[["FundID","Adj Strategy"]],
+    on="FundID", how="left"
+)
+
+rho_soft_by_strategy = (
+    tmp_rho.dropna(subset=["rho_emp","Adj Strategy"])
+           .groupby("Adj Strategy")["rho_emp"]
+           .quantile(SOFT_RHO_PCTL)
+)
+
+# expiry soft from KMP funds by strategy
+fund_kmp_merge = (
+    data.sort_values(["FundID","quarter_end"]).groupby("FundID").tail(1)[["FundID","Adj Strategy"]]
+    .merge(kmp2, on="FundID", how="left")
+)
+exp_soft_by_strategy = (
+    fund_kmp_merge[fund_kmp_merge["Expiration_Quarters"].notna()]
+    .groupby("Adj Strategy")["Expiration_Quarters"].median()
+)
+
+def soft_params(strategy: str) -> Tuple[float,int]:
+    rho = float(rho_soft_by_strategy.get(strategy, 0.0))
+    E = exp_soft_by_strategy.get(strategy, np.nan)
+    E = int(E) if pd.notna(E) else SOFT_EXPIRY_FALLBACK
+    rho = float(np.clip(rho, 0.0, 1.0))
+    E = max(int(E), 0)
+    return rho, E
+
+def get_rho_E(fid: str, strategy: str) -> Tuple[float,int]:
+    """Get recallable cap (rho) and expiry (E) per fund, fall back to strategy soft params."""
+    if fid in kmp2.index:
+        r = kmp2.loc[fid]
+        rho = float(r.get("Recallable_Percentage_Decimal", np.nan))
+        E = r.get("Expiration_Quarters", np.nan)
+        if pd.notna(rho) and pd.notna(E):
+            rho = float(np.clip(rho, 0.0, 1.0))
+            return rho, max(int(E), 0)
+    # fallback: strategy soft params
+    return soft_params(strategy)
+
+# =============================
+# Load omega projection + NAV_start (NEW)
+# =============================
+def find_omega_file(data_dir: str) -> str:
+    cands = glob.glob(os.path.join(data_dir, "omega_projection_sota_*.parquet")) + \
+            glob.glob(os.path.join(data_dir, "omega_projection_sota_*.csv"))
+    if not cands:
+        raise FileNotFoundError("No omega_projection_sota_* file found. Run NAV Logic first.")
+    cands.sort(key=os.path.getmtime, reverse=True)
+    return cands[0]
+
+def find_navstart_file(data_dir: str, year: int, quarter: str) -> str:
+    cands = [
+        os.path.join(data_dir, f"nav_start_sota_{year}_{quarter}.parquet"),
+        os.path.join(data_dir, f"nav_start_sota_{year}_{quarter}.csv"),
+    ]
+    for p in cands:
+        if os.path.exists(p):
+            return p
+    # fallback: latest nav_start_sota_*
+    c2 = glob.glob(os.path.join(data_dir, "nav_start_sota_*.parquet")) + \
+         glob.glob(os.path.join(data_dir, "nav_start_sota_*.csv"))
+    if not c2:
+        raise FileNotFoundError("No nav_start_sota_* file found. Run NAV Logic first.")
+    c2.sort(key=os.path.getmtime, reverse=True)
+    return c2[0]
+
+omega_path = find_omega_file(DATA_DIR)
+navstart_path = find_navstart_file(DATA_DIR, year, quarter)
+
+print("Using omega file:", omega_path)
+print("Using nav_start file:", navstart_path)
+
+omega_df = pd.read_parquet(omega_path) if omega_path.lower().endswith(".parquet") else pd.read_csv(omega_path)
+navstart = pd.read_parquet(navstart_path) if navstart_path.lower().endswith(".parquet") else pd.read_csv(navstart_path)
+
+need_omega = {"FundID","quarter_end","omega","Adj Strategy","Grade"}
+if not need_omega.issubset(omega_df.columns):
+    raise ValueError(f"omega_projection must contain columns: {need_omega}")
+
+need_ns = {"FundID","NAV_start","cap_qe"}
+if not need_ns.issubset(navstart.columns):
+    raise ValueError(f"nav_start must contain columns: {need_ns}")
+
+omega_df = omega_df.copy()
+omega_df["quarter_end"] = pd.to_datetime(omega_df["quarter_end"])
+omega_df["omega"] = pd.to_numeric(omega_df["omega"], errors="coerce").fillna(0.0)
+omega_df["msci_ret_q"] = pd.to_numeric(omega_df.get("msci_ret_q", 0.0), errors="coerce").fillna(0.0)
+if "sim_id" not in omega_df.columns:
+    omega_df["sim_id"] = 1
+omega_df["sim_id"] = pd.to_numeric(omega_df["sim_id"], errors="coerce").fillna(1).astype(int)
+sim_ids = sorted(omega_df["sim_id"].unique())
+msci_stats = omega_df.groupby("sim_id")["msci_ret_q"].agg(["mean", "std"]).to_dict("index")
+
+# For structural MC, use the first omega sim path (mean MSCI path by default)
+omega_sim_id = sim_ids[0] if len(sim_ids) else 1
+if N_SIM > 1 and len(sim_ids) > 1:
+    print("WARNING: omega_projection contains multiple sim_id; using sim_id=", omega_sim_id, "for structural MC mean path.")
+
+omega_df["msci_ret_q"] = pd.to_numeric(omega_df.get("msci_ret_q", 0.0), errors="coerce").fillna(0.0)
+msci_mu = float(omega_df["msci_ret_q"].mean())
+msci_sigma = float(omega_df["msci_ret_q"].std(ddof=1))
+if not np.isfinite(msci_sigma) or msci_sigma <= 0:
+    msci_sigma = 1.0
+
+
+# Ensure grade strings
+omega_df["Grade"] = omega_df["Grade"].astype(str).str.strip()
+omega_df.loc[~omega_df["Grade"].isin(GRADE_STATES), "Grade"] = "D"
+
+navstart = navstart.copy()
+navstart["NAV_start"] = pd.to_numeric(navstart["NAV_start"], errors="coerce").fillna(0.0).clip(lower=0.0)
+navstart["cap_qe"] = pd.to_datetime(navstart["cap_qe"], errors="coerce")
+
+# Keep only funds present in omega_df
+funds = sorted(set(omega_df["FundID"]).intersection(set(navstart["FundID"])))
+if not funds:
+    raise ValueError("No overlap between omega_projection and nav_start funds.")
+
+omega_df = omega_df[omega_df["FundID"].isin(funds)].copy()
+navstart = navstart[navstart["FundID"].isin(funds)].copy()
+
+# =============================
+# Simulation loop (endogenous NAV) — structural MC
+# =============================
+
+out = []
+
+fund_index = {fid:i for i, fid in enumerate(funds)}
+n_funds = len(funds)
+
+# historical drawdowns up to first sim quarter (used for DD_cum_commit init)
+sim_start_qe = omega_df["quarter_end"].min() if len(omega_df) else None
+draw_cum_hist = {}
+if sim_start_qe is not None:
+    hist = data[data["quarter_end"] <= sim_start_qe].copy()
+    draw_cum_hist = hist.groupby("FundID")["Adj Drawdown EUR"].sum().to_dict()
+
+# Structural MC aggregation (mean path)
+AVG_COLS = [
+    "NAV_prev","omega","msci_ret_q","Stopped_NAV_Zero",
+    "RC_Avail_Pre","Remaining_Commit_Pre","Capacity_Pre",
+    "Draw_Event","Draw_Forced_IP","Draw_Amount","Use_Recallable","Use_Commitment","DD_Cum_Commitment",
+    "Rep_Event","Rep_Regular","Rep_Terminal","Rep_Total",
+    "RC_Event","RC_Added",
+    "NAV_after_flow","NAV_after_valuation","NAV_end",
+    "RC_Avail_Post","Remaining_Commit_Post","Capacity_Post",
+    "rho_used","E_used","q_left_to_cap","tail_factor",
+]
+
+agg_sum = {}
+agg_cnt = {}
+agg_meta = {}
+
+# Select omega path for structural MC
+omega_base = omega_df[omega_df["sim_id"] == omega_sim_id].copy()
+
+def add_row_to_agg(row):
+    key = (row["FundID"], row["quarter_end"], row["step_q"])
+    if key not in agg_sum:
+        agg_sum[key] = {c: 0.0 for c in AVG_COLS}
+        agg_cnt[key] = 0
+        agg_meta[key] = {
+            "FundID": row["FundID"],
+            "quarter_end": row["quarter_end"],
+            "step_q": row["step_q"],
+            "Adj Strategy": row.get("Adj Strategy"),
+            "Grade": row.get("Grade"),
+            "AgeBucket": row.get("AgeBucket"),
+            "IP_Q_Used": row.get("IP_Q_Used"),
+            "cap_qe": row.get("cap_qe"),
+            "qe_last": row.get("qe_last"),
+        }
+    for c in AVG_COLS:
+        agg_sum[key][c] += float(row.get(c, 0.0))
+    agg_cnt[key] += 1
+
+# Run structural MC
+n_runs = N_SIM if N_SIM > 1 else max(len(sim_ids), 1)
+
+for run_id in range(1, n_runs + 1):
+    # For N_SIM == 1, preserve scenario-aware behavior if omega has multiple sim_id
+    if N_SIM == 1 and len(sim_ids) > 1:
+        omega_sim = omega_df[omega_df["sim_id"] == sim_ids[run_id-1]].copy()
+        sim_label = int(sim_ids[run_id-1])
+    else:
+        omega_sim = omega_base.copy()
+        sim_label = int(run_id)
+
+    if omega_sim.empty:
+        continue
+
+    quarters = sorted(omega_sim["quarter_end"].drop_duplicates().tolist())
+    quarters = quarters[:n_q]
+    if not quarters:
+        continue
+
+    rng = np.random.default_rng(SEED + int(sim_label))
+
+    # MSCI stats for direct repayment sensitivity
+    msci_stat_id = sim_label if (N_SIM == 1 and len(sim_ids) > 1) else omega_sim_id
+    msci_mu = float(msci_stats.get(msci_stat_id, {}).get("mean", 0.0))
+    msci_sigma = float(msci_stats.get(msci_stat_id, {}).get("std", 1.0))
+    if not np.isfinite(msci_sigma) or msci_sigma <= 0:
+        msci_sigma = 1.0
+
+    # per-quarter copula uniforms
+    U_by_q = {}
+    for qe in quarters:
+        U_by_q[qe] = {
+            "draw_event": one_factor_uniforms(n_funds, rng, RHO_MKT),
+            "draw_size":  one_factor_uniforms(n_funds, rng, RHO_MKT),
+            "rep_event":  one_factor_uniforms(n_funds, rng, RHO_MKT),
+            "rep_size":   one_factor_uniforms(n_funds, rng, RHO_MKT),
+            "rc_event":   one_factor_uniforms(n_funds, rng, RHO_MKT),
+            "rc_size":    one_factor_uniforms(n_funds, rng, RHO_MKT),
+        }
+
+    # Initialize fund state + ledgers (per sim)
+    state = {}
+    ledgers = {}
+    navstart_idx = navstart.set_index("FundID")
+
+    for fid in funds:
+        ns = navstart_idx.loc[fid]
+        nav0 = float(ns["NAV_start"])
+        cap_qe = ns["cap_qe"]
+
+        # strategy/grade0 for reference (omega provides time-varying grade)
+        strat0 = ns["Adj Strategy"] if "Adj Strategy" in ns.index else omega_sim[omega_sim["FundID"] == fid]["Adj Strategy"].iloc[0]
+
+        C = float(fund_commit.get(fid, 0.0) or 0.0)
+        C = max(C, 0.0)
+
+        rho, E = get_rho_E(fid, strat0)
+        ledgers[fid] = RecallableLedger(rho=rho, expiry_quarters=E, commitment=C)
+
+        draw_hist = float(draw_cum_hist.get(fid, 0.0) or 0.0)
+        dd_cum_commit0 = min(draw_hist, C)
+
+        state[fid] = {
+            "NAV": nav0,
+            "DD_cum_commit": dd_cum_commit0,
+            "alive": True,
+            "cap_qe": cap_qe,
+            "Commitment": C,
+        }
+
+    # pre-group omega rows per fund
+    omega_by_fund = {fid: omega_sim[omega_sim["FundID"] == fid].sort_values("quarter_end").copy() for fid in funds}
+
+    for fid in funds:
+        st = state[fid]
+        ledger = ledgers[fid]
+        df_f = omega_by_fund[fid]
+
+        # apply cap_qe filter
+        cap_qe = st["cap_qe"]
+        if pd.notna(cap_qe):
+            df_f = df_f[df_f["quarter_end"] <= cap_qe].copy()
+        df_f = df_f.head(n_q).copy()
+        if df_f.empty:
+            continue
+
+        # last quarter for terminal enforcement
+        qe_last = df_f["quarter_end"].max()
+
+        for step, row in enumerate(df_f.itertuples(index=False), start=1):
+            qe = row.quarter_end
+            if qe not in U_by_q:
+                continue
+
+            # grade/strategy from omega path (consistent with omega generation)
+            rdict = row._asdict()
+            strategy = rdict.get("Adj Strategy", None)
+            grade = rdict.get("Grade", "D")
+            omega_t = float(rdict.get("omega", 0.0))
+            msci_r = float(rdict.get("msci_ret_q", 0.0))
+
+            # age for calibration (prefer Fund_Age_Quarters from omega file if present)
+            age_q = rdict.get("Fund_Age_Quarters", None)
+            if age_q is None or pd.isna(age_q):
+                age_q = step
+            age_q = int(round(float(age_q)))
+            age_bucket = make_age_bucket_q(float(age_q))
+
+            total_steps = len(df_f)
+            q_left = total_steps - step
+            tail_factor = 0.0
+            if RUNOFF_Q > 0:
+                tail_factor = max(0.0, (RUNOFF_Q - q_left) / float(RUNOFF_Q))
+                tail_factor = float(np.clip(tail_factor, 0.0, 1.0))
+
+            msci_z = (msci_r - msci_mu) / msci_sigma
+            msci_z = float(np.clip(msci_z, -MSCI_Z_CLIP, MSCI_Z_CLIP))
+            msci_z_eff = max(msci_z, 0.0) if MSCI_REP_POS_ONLY else msci_z
+
+            # stop if NAV already ~0 (still emit zeros for remaining quarters)
+            NAV_prev = float(st["NAV"])
+            if NAV_prev <= NAV_STOP_EPS:
+                st["alive"] = False
+                st["NAV"] = 0.0
+                row_out = {
+                    "FundID": fid, "quarter_end": qe, "step_q": step,
+                    "Adj Strategy": strategy, "Grade": grade, "AgeBucket": age_bucket, "IP_Q_Used": None,
+                    "NAV_prev": NAV_prev, "omega": omega_t, "msci_ret_q": float(msci_r),
+                    "Stopped_NAV_Zero": 1,
+                    "Capacity_Pre": 0.0,
+                    "Draw_Event": 0, "Draw_Forced_IP": 0, "Draw_Amount": 0.0,
+                    "Rep_Event": 0, "Rep_Regular": 0.0, "Rep_Terminal": 0.0, "Rep_Total": 0.0,
+                    "RC_Event": 0, "RC_Added": 0.0,
+                    "NAV_after_flow": 0.0,
+                    "NAV_after_valuation": 0.0,
+                    "NAV_end": 0.0,
+                    "RC_Avail_Pre": 0.0, "Remaining_Commit_Pre": 0.0, "Capacity_Pre": 0.0,
+                    "RC_Avail_Post": 0.0, "Remaining_Commit_Post": 0.0, "Capacity_Post": 0.0,
+                    "Use_Recallable": 0.0, "Use_Commitment": 0.0, "DD_Cum_Commitment": st["DD_cum_commit"],
+                    "rho_used": float(ledger.rho), "E_used": int(ledger.expiry_quarters),
+                    "cap_qe": st["cap_qe"], "qe_last": qe_last,
+                    "q_left_to_cap": int(max(q_left, 0)), "tail_factor": float(tail_factor),
+                }
+                if N_SIM > 1:
+                    add_row_to_agg(row_out)
+                else:
+                    row_out["sim_id"] = int(sim_label)
+                    out.append(row_out)
+                continue
+
+            # capacity
+            rc_avail_pre = ledger.available(step)
+            remaining_commit_pre = max(st["Commitment"] - st["DD_cum_commit"], 0.0)
+            capacity_pre = remaining_commit_pre + rc_avail_pre
+
+            params = lookup_params(strategy, grade, age_bucket)
+
+            # copula uniforms for this quarter (fund-specific index)
+            i = fund_index[fid]
+            U = U_by_q[qe]
+
+            # drawdown age scaling + investment period gate (optional)
+            ip_q = int(ip_by_strategy.get(strategy, IP_Q_DEFAULT))
+            draw_mult = 1.0
+            if USE_DRAW_AGE_SHAPE:
+                if ip_q > 0:
+                    if ENFORCE_IP_LIMITS and age_q > ip_q:
+                        draw_mult = 0.0
+                    else:
+                        frac = float(age_q) / float(ip_q)
+                        draw_mult = max(DRAW_AGE_MIN_MULT, (1.0 - frac) ** DRAW_AGE_DECAY_POWER)
+            if USE_HAZARD_MODELS and beta_draw is not None:
+                Xr = build_feature_row(strategy, grade, age_q, 0.0, False, hazard_meta["draw_cols"], hazard_meta["draw_means"], hazard_meta["draw_stds"])
+                p_draw_base = float(_sigmoid(Xr @ beta_draw)[0])
+            else:
+                p_draw_base = float(params.get("p_draw", 0.0))
+            p_draw_adj = p_draw_base * draw_mult
+
+            # ---- Drawdown ----
+            draw_event = (U["draw_event"][i] < p_draw_adj) and (capacity_pre > 0.0)
+            draw_amt = 0.0
+            use_rc = 0.0
+            use_commit = 0.0
+            draw_forced_ip = 0
+
+            if draw_event:
+                ratio = lognormal_from_u(params["mu_draw"], params["sig_draw"], float(U["draw_size"][i]))
+                ratio = float(np.clip(ratio, 0.0, 1.0))
+                draw_amt = ratio * capacity_pre
+                cons = ledger.consume_for_drawdown(step, draw_amt)
+                use_rc = cons["use_rc"]
+                use_commit = cons["use_commitment"]
+                st["DD_cum_commit"] += use_commit
+
+            # enforce full commitment call at end of investment period (optional)
+            if ENFORCE_IP_LIMITS and age_q == ip_q:
+                remaining_commit_after = max(st["Commitment"] - st["DD_cum_commit"], 0.0)
+                if remaining_commit_after > 0.0:
+                    draw_amt += remaining_commit_after
+                    use_commit += remaining_commit_after
+                    st["DD_cum_commit"] += remaining_commit_after
+                    draw_event = True
+                    draw_forced_ip = 1
+
+            # ---- Repayment (regular) ----
+            rep_regular = 0.0
+            if USE_HAZARD_MODELS and beta_rep is not None:
+                Xr = build_feature_row(strategy, grade, age_q, np.log1p(abs(NAV_prev)), True, hazard_meta["rep_cols"], hazard_meta["rep_means"], hazard_meta["rep_stds"])
+                p_rep_base = float(_sigmoid(Xr @ beta_rep)[0])
+            else:
+                p_rep_base = float(params["p_rep"])
+            grade_key = grade if grade in GRADE_P_MULT else "D"
+            p_rep_adj = 1.0 - (1.0 - p_rep_base) ** (1.0 + REP_RAMP_P * tail_factor)
+            p_rep_adj = min(1.0, p_rep_adj + REP_RAMP_FLOOR * tail_factor)
+            p_rep_adj = min(1.0, p_rep_adj * float(GRADE_P_MULT.get(grade_key, 1.0)))
+            # MSCI direct boost on hazard (logit shift)
+            p_rep_adj = float(np.clip(p_rep_adj, 1e-6, 1.0 - 1e-6))
+            logit_p = np.log(p_rep_adj / (1.0 - p_rep_adj))
+            logit_p += MSCI_REP_P_BETA * msci_z_eff
+            p_rep_adj = float(1.0 / (1.0 + np.exp(-logit_p)))
+            rep_event = (U["rep_event"][i] < p_rep_adj) and (NAV_prev > NAV_EPS)
+            if rep_event:
+                rep_ratio = lognormal_from_u(params["mu_rep"], params["sig_rep"], float(U["rep_size"][i]))
+                rep_ratio = float(np.clip(rep_ratio, 0.0, 1.0))
+                rep_ratio = min(rep_ratio * (1.0 + REP_RAMP_SIZE * tail_factor), 1.0)
+                rep_ratio = min(rep_ratio * float(GRADE_SIZE_MULT.get(grade_key, 1.0)), 1.0)
+                # MSCI direct boost on size
+                size_mult = max(0.0, 1.0 + MSCI_REP_SIZE_BETA * msci_z_eff)
+                rep_ratio = min(rep_ratio * size_mult, 1.0)
+                rep_regular = rep_ratio * NAV_prev
+
+            # ---- Recallable (conditional on regular repayment ONLY) ----
+            rc_added = 0.0
+            rc_event = (rep_regular > 0.0) and (U["rc_event"][i] < params["p_rc_given_rep"])
+            if rc_event:
+                rc_ratio = lognormal_from_u(params["mu_rc"], params["sig_rc"], float(U["rc_size"][i]))
+                rc_ratio = float(np.clip(rc_ratio, 0.0, 1.0))
+                rc_amt_raw = rc_ratio * rep_regular
+                rc_added = ledger.add_recallable(step, rc_amt_raw, enforce_cap=True)
+
+            # ---- Endogenous NAV update ----
+            nav_after_flow = NAV_prev + float(draw_amt) - float(rep_regular)
+            nav_after_flow = max(nav_after_flow, 0.0)
+
+            nav_after_val = nav_after_flow * (1.0 + float(omega_t))
+            if not np.isfinite(nav_after_val):
+                nav_after_val = 0.0
+            nav_after_val = max(float(nav_after_val), 0.0)
+
+            rep_terminal = 0.0
+            nav_end = nav_after_val
+
+            if q_left == 0:
+                st["alive"] = False
+
+            st["NAV"] = nav_end
+
+            # post capacity
+            rc_avail_post = ledger.available(step)
+            remaining_commit_post = max(st["Commitment"] - st["DD_cum_commit"], 0.0)
+            capacity_post = remaining_commit_post + rc_avail_post
+
+            row_out = {
+                "FundID": fid,
+                "quarter_end": qe,
+                "step_q": step,
+                "Adj Strategy": strategy,
+                "Grade": grade,
+                "AgeBucket": age_bucket,
+                "IP_Q_Used": int(ip_q),
+
+                "omega": float(omega_t),
+                "msci_ret_q": float(msci_r),
+
+                "NAV_prev": float(NAV_prev),
+                "Stopped_NAV_Zero": 0,
+
+                "RC_Avail_Pre": float(rc_avail_pre),
+                "Remaining_Commit_Pre": float(remaining_commit_pre),
+                "Capacity_Pre": float(capacity_pre),
+
+                "Draw_Event": int(draw_event),
+                "Draw_Forced_IP": int(draw_forced_ip),
+                "Draw_Amount": float(draw_amt),
+                "Use_Recallable": float(use_rc),
+                "Use_Commitment": float(use_commit),
+                "DD_Cum_Commitment": float(st["DD_cum_commit"]),
+
+                "Rep_Event": int(rep_event),
+                "Rep_Regular": float(rep_regular),
+                "Rep_Terminal": float(rep_terminal),
+                "Rep_Total": float(rep_regular + rep_terminal),
+
+                "RC_Event": int(rc_event),
+                "RC_Added": float(rc_added),
+
+                "NAV_after_flow": float(nav_after_flow),
+                "NAV_after_valuation": float(nav_after_val),
+                "NAV_end": float(nav_end),
+
+                "RC_Avail_Post": float(rc_avail_post),
+                "Remaining_Commit_Post": float(remaining_commit_post),
+                "Capacity_Post": float(capacity_post),
+
+                "rho_used": float(ledger.rho),
+                "E_used": int(ledger.expiry_quarters),
+                "cap_qe": st["cap_qe"],
+                "qe_last": qe_last,
+                "q_left_to_cap": int(max(q_left, 0)),
+                "tail_factor": float(tail_factor),
+            }
+
+            if N_SIM > 1:
+                add_row_to_agg(row_out)
+            else:
+                row_out["sim_id"] = int(sim_label)
+                out.append(row_out)
+
+# Build output dataframe
+if N_SIM > 1:
+    rows = []
+    for key, sums in agg_sum.items():
+        cnt = agg_cnt.get(key, 1)
+        meta = agg_meta.get(key, {})
+        row = dict(meta)
+        for c in AVG_COLS:
+            row[c] = sums[c] / float(cnt)
+        rows.append(row)
+    sim = pd.DataFrame(rows)
+else:
+    sim = pd.DataFrame(out)
+
+sim = pd.DataFrame(out)
+print("\nSimulated rows:", len(sim))
+print("Simulated funds:", sim["FundID"].nunique())
+
+# =============================
+# Save
+# =============================
+save = input("Save structural cashflow outputs? (y/n) [y]: ").strip().lower()
+if save in {"", "y", "yes"}:
+    out_csv = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.csv")
+    out_pq  = os.path.join(DATA_DIR, f"structural_cashflows_endogenous_{year}_{quarter}_{n_q}q.parquet")
+    sim.to_csv(out_csv, index=False, sep=";", encoding="utf-8-sig")
+    sim.to_parquet(out_pq, index=False)
+    print("Saved:")
+    print(out_csv)
+    print(out_pq)
+
+# =============================
+# Sanity checks
+# =============================
+print("\nSanity checks:")
+print("Total Draw:", float(sim["Draw_Amount"].sum()))
+print("Total Rep Regular:", float(sim["Rep_Regular"].sum()))
+print("Total Rep Terminal:", float(sim["Rep_Terminal"].sum()))
+print("Total Rep Total:", float(sim["Rep_Total"].sum()))
+print("Total Recallable Added:", float(sim["RC_Added"].sum()))
+
+# NAV at end should be 0 for ended funds (by construction)
+end_nav = sim.sort_values(["FundID","quarter_end"]).groupby("FundID").tail(1)
+if N_SIM == 1:
+    print("End NAV > 0 (should be 0):", int((end_nav["NAV_end"] > 1e-6).sum()))
+else:
+    print("End NAV > 0 (mean path):", int((end_nav["NAV_end"] > 1e-6).sum()))
+
+# Cap compliance (RC <= rho*C) at fund end
+end_nav = end_nav.copy()
+end_nav["rc_cap"] = end_nav["rho_used"] * end_nav["Commitment_Level"] if "Commitment_Level" in end_nav.columns else end_nav["rho_used"] * end_nav["Remaining_Commit_Post"].add(end_nav["DD_Cum_Commitment"], fill_value=0.0)
+# Better: use state commitment = Commitment from output
+end_nav["rc_cap"] = end_nav["rho_used"] * end_nav["Remaining_Commit_Post"].add(end_nav["DD_Cum_Commitment"], fill_value=0.0)
+viol = end_nav[end_nav["RC_Avail_Post"] - end_nav["rc_cap"] > 1e-6]
+print("Cap violations at end (should be 0):", len(viol))
+if len(viol):
+    print(viol[["FundID","RC_Avail_Post","rc_cap","rho_used"]].head(20))
+
+print("\nRuntime (seconds):", round(time.perf_counter() - t0, 2))
+
+
+
+
+
+
+
+
+
+# =============================
+# Check: totals for projected funds with lifetime ended (historical + projection)
+# =============================
+# Lifetime ended: reached cap (q_left_to_cap == 0)
+end_state = sim.sort_values(["FundID","quarter_end"]).groupby("FundID").tail(1).copy()
+end_state["lifetime_ended"] = (end_state["q_left_to_cap"] == 0)
+
+projected_funds = set(sim["FundID"].unique())
+ended_funds = end_state.loc[end_state["lifetime_ended"], "FundID"].tolist()
+ended_funds = [f for f in ended_funds if f in projected_funds]
+
+# Historical totals up to simulation start
+hist_tot = pd.DataFrame(columns=["FundID","draw_hist","rep_hist"])
+if sim_start_qe is not None:
+    hist_tot = (data[data["quarter_end"] <= sim_start_qe]
+                .groupby("FundID", as_index=False)
+                .agg(draw_hist=("Adj Drawdown EUR","sum"),
+                     rep_hist=("Adj Repayment EUR","sum")))
+
+# Projected totals from simulation
+proj_tot = (sim.groupby("FundID", as_index=False)
+            .agg(draw_proj=("Draw_Amount","sum"),
+                 rep_proj=("Rep_Total","sum")))
+
+check = (proj_tot.merge(hist_tot, on="FundID", how="left")
+         .fillna(0.0))
+check["draw_total"] = check["draw_hist"] + check["draw_proj"]
+check["rep_total"] = check["rep_hist"] + check["rep_proj"]
+
+check = check[check["FundID"].isin(ended_funds)].copy()
+
+# Summary row
+summary = pd.DataFrame([{
+    "FundID": "ALL_ENDED",
+    "draw_hist": check["draw_hist"].sum(),
+    "rep_hist": check["rep_hist"].sum(),
+    "draw_proj": check["draw_proj"].sum(),
+    "rep_proj": check["rep_proj"].sum(),
+    "draw_total": check["draw_total"].sum(),
+    "rep_total": check["rep_total"].sum(),
+}])
+
+check_out = pd.concat([check, summary], ignore_index=True)
+
+# Save
+check_csv = os.path.join(DATA_DIR, "check.csv")
+check_pq = os.path.join(DATA_DIR, "check.parquet")
+check_out.to_csv(check_csv, index=False)
+check_out.to_parquet(check_pq, index=False)
+print("Saved check:", check_csv)
+print("Saved check:", check_pq)
+
+
+
+
