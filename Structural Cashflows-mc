@@ -1262,8 +1262,12 @@ if N_SIM > 1:
     sim = pd.DataFrame(rows)
 else:
     sim = pd.DataFrame(out)
+if sim.empty or "FundID" not in sim.columns:
+    raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
 
 sim = pd.DataFrame(out)
+if sim.empty or "FundID" not in sim.columns:
+    raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
 print("\nSimulated rows:", len(sim))
 print("Simulated funds:", sim["FundID"].nunique())
 
@@ -1368,6 +1372,7 @@ check_out.to_csv(check_csv, index=False)
 check_out.to_parquet(check_pq, index=False)
 print("Saved check:", check_csv)
 print("Saved check:", check_pq)
+
 
 
 
