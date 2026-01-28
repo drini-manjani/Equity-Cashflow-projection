@@ -748,10 +748,19 @@ def main():
     else:
         raise FileNotFoundError("Missing kmp.parquet or kmp.csv")
 
+    # normalize column names (trim/collapse spaces) to avoid hidden KeyErrors
+    def _norm_col(c):
+        if not isinstance(c, str):
+            return c
+        return " ".join(c.strip().split())
+
+    data.columns = [_norm_col(c) for c in data.columns]
+    kmp.columns = [_norm_col(c) for c in kmp.columns]
+
     req = [
         "FundID", "Adj Strategy", "Grade", "Fund_Age_Quarters",
         "Year of Transaction Date", "Quarter of Transaction Date",
-        "Commitment EUR", "Adj Drawdown EUR", "Adj Repayment EUR",
+        "Adj Drawdown EUR", "Adj Repayment EUR",
         "NAV Adjusted EUR", "Recallable",
         "Planned end date with add. years as per legal doc",
     ]
@@ -759,8 +768,34 @@ def main():
     if missing:
         raise ValueError(f"Missing required columns in data: {missing}")
 
+    # Commitment column aliases (some datasets use different naming)
+    def _norm_key(s: str) -> str:
+        return " ".join(s.strip().lower().replace("_", " ").split())
+
+    col_by_key = {_norm_key(c): c for c in data.columns if isinstance(c, str)}
+
+    commit_level_col = None
+    commit_flow_col = None
+    for c in ["Commitment_Level", "Commitment Level", "commitment level"]:
+        key = _norm_key(c)
+        if key in col_by_key:
+            commit_level_col = col_by_key[key]
+            break
+    for c in ["Commitment EUR", "Commitment", "commitment eur", "commitment"]:
+        key = _norm_key(c)
+        if key in col_by_key:
+            commit_flow_col = col_by_key[key]
+            break
+    if commit_level_col is None and commit_flow_col is None:
+        raise ValueError("Missing commitment column: expected one of Commitment_Level / Commitment Level / Commitment EUR / Commitment")
+
     # Clean numeric
-    for c in ["Commitment EUR", "Adj Drawdown EUR", "Adj Repayment EUR", "NAV Adjusted EUR", "Recallable", "Fund_Age_Quarters"]:
+    num_cols = ["Adj Drawdown EUR", "Adj Repayment EUR", "NAV Adjusted EUR", "Recallable", "Fund_Age_Quarters"]
+    if commit_level_col is not None:
+        num_cols.append(commit_level_col)
+    if commit_flow_col is not None:
+        num_cols.append(commit_flow_col)
+    for c in num_cols:
         data[c] = pd.to_numeric(data[c], errors="coerce")
 
     data["Adj Drawdown EUR"] = data["Adj Drawdown EUR"].fillna(0.0).clip(lower=0.0)
@@ -806,19 +841,27 @@ def main():
     msci_q = msci_q.sort_values("quarter_end").reset_index(drop=True)
     msci_q["msci_ret_q_lag1"] = msci_q["msci_ret_q"].shift(1)
 
-    # Train/test splits
+    # Train/test splits (initial)
     train = data[data["quarter_end"] <= train_end_qe].copy()
     test = data[data["quarter_end"] >= test_start_qe].copy()
 
     if train.empty or test.empty:
         raise ValueError("Train or test split is empty. Adjust dates.")
 
+    # Commitment proxy (full history)
+    if commit_level_col is not None:
+        data["Commitment_Level"] = data[commit_level_col].fillna(0.0)
+    else:
+        data["Commitment_Level"] = data.groupby("FundID")[commit_flow_col].cumsum().fillna(0.0)
+    fund_commit = data.groupby("FundID")["Commitment_Level"].max().fillna(0.0).to_dict()
+    # Refresh train/test to include Commitment_Level
+    train = data[data["quarter_end"] <= train_end_qe].copy()
+    test = data[data["quarter_end"] >= test_start_qe].copy()
+    if train.empty or test.empty:
+        raise ValueError("Train or test split is empty after commitment prep. Adjust dates.")
+
     # Funds in test window
     test_funds = test["FundID"].unique().tolist()
-
-    # Commitment proxy (full history)
-    data["Commitment_Level"] = data.groupby("FundID")["Commitment EUR"].cumsum().fillna(0.0)
-    fund_commit = data.groupby("FundID")["Commitment_Level"].max().fillna(0.0).to_dict()
 
     # Planned end date (cap)
     data["planned_end_qe"] = pd.to_datetime(
@@ -935,6 +978,13 @@ def main():
     }
 
     # cap proxy for draw ratios
+    if "Commitment_Level" not in train.columns:
+        if commit_level_col is not None and commit_level_col in train.columns:
+            train["Commitment_Level"] = train[commit_level_col].fillna(0.0)
+        elif commit_flow_col is not None and commit_flow_col in train.columns:
+            train["Commitment_Level"] = train.groupby("FundID")[commit_flow_col].cumsum().fillna(0.0)
+        else:
+            raise ValueError("Commitment_Level missing in train and no usable commitment column found.")
     train["cap_proxy"] = train["Commitment_Level"].fillna(0.0)
     train["draw_event"] = (train["Adj Drawdown EUR"] > 0).astype(int)
     train["rep_event"] = (train["Adj Repayment EUR"] > 0).astype(int)
