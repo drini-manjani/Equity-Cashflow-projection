@@ -36,8 +36,19 @@ def quarter_range(start_qe: pd.Timestamp, end_qe: pd.Timestamp) -> List[pd.Times
     return [p.to_timestamp("Q") for p in pd.period_range(p0, p1, freq="Q")]
 
 
+def _to_period_q(x) -> pd.Period:
+    if isinstance(x, pd.Period):
+        return x.asfreq("Q")
+    try:
+        return pd.Period(x, freq="Q")
+    except Exception:
+        return pd.Period(pd.Timestamp(x), freq="Q")
+
+
 def quarter_diff(qe: pd.Timestamp, start_qe: pd.Timestamp) -> int:
-    return int(pd.Period(qe, freq="Q") - pd.Period(start_qe, freq="Q"))
+    p = _to_period_q(qe)
+    s = _to_period_q(start_qe)
+    return int(p.ordinal - s.ordinal)
 
 
 # -----------------------------
