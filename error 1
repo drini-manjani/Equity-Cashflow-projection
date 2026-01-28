@@ -1,19 +1,111 @@
 ---------------------------------------------------------------------------
-TypeError                                 Traceback (most recent call last)
-Cell In[4], line 1792
-   1788     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
-   1791 if __name__ == "__main__":
--> 1792     main()
+ValueError                                Traceback (most recent call last)
+Cell In[5], line 1803
+   1799     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
+   1802 if __name__ == "__main__":
+-> 1803     main()
 
-Cell In[4], line 1349, in main()
-   1347 for _, row in hist_pre.iterrows():
-   1348     qe = row["quarter_end"]
--> 1349     step = quarter_diff(qe, start_qe)
-   1350     draw = float(row.get("Adj Drawdown EUR") or 0.0)
-   1351     rep = float(row.get("Adj Repayment EUR") or 0.0)
+Cell In[5], line 1410, in main()
+   1408 # grid for test quarters
+   1409 grid = pd.DataFrame(index=pd.Index(test_quarters, name="quarter_end"))
+-> 1410 grid["Draw"] = hist["Adj Drawdown EUR"]
+   1411 grid["Rep"] = hist["Adj Repayment EUR"]
+   1412 grid["NAV"] = hist["NAV Adjusted EUR"]
 
-Cell In[4], line 40, in quarter_diff(qe, start_qe)
-     39 def quarter_diff(qe: pd.Timestamp, start_qe: pd.Timestamp) -> int:
----> 40     return int(pd.Period(qe, freq="Q") - pd.Period(start_qe, freq="Q"))
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\frame.py:4299, in DataFrame.__setitem__(self, key, value)
+   4296     self._setitem_array([key], value)
+   4297 else:
+   4298     # set column
+-> 4299     self._set_item(key, value)
 
-TypeError: int() argument must be a string, a bytes-like object or a real number, not 'pandas._libs.tslibs.offsets.QuarterEnd'
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\frame.py:4512, in DataFrame._set_item(self, key, value)
+   4502 def _set_item(self, key, value) -> None:
+   4503     """
+   4504     Add series to DataFrame in specified column.
+   4505 
+   (...)
+   4510     ensure homogeneity.
+   4511     """
+-> 4512     value, refs = self._sanitize_column(value)
+   4514     if (
+   4515         key in self.columns
+   4516         and value.ndim == 1
+   4517         and not isinstance(value.dtype, ExtensionDtype)
+   4518     ):
+   4519         # broadcast across multiple columns if necessary
+   4520         if not self.columns.is_unique or isinstance(self.columns, MultiIndex):
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\frame.py:5250, in DataFrame._sanitize_column(self, value)
+   5248     if not isinstance(value, Series):
+   5249         value = Series(value)
+-> 5250     return _reindex_for_setitem(value, self.index)
+   5252 if is_list_like(value):
+   5253     com.require_length_match(value, self.index)
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\frame.py:12679, in _reindex_for_setitem(value, index)
+  12675 except ValueError as err:
+  12676     # raised in MultiIndex.from_tuples, see test_insert_error_msmgs
+  12677     if not value.index.is_unique:
+  12678         # duplicate axis
+> 12679         raise err
+  12681     raise TypeError(
+  12682         "incompatible index of inserted column with frame index"
+  12683     ) from err
+  12684 return reindexed_value, None
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\frame.py:12674, in _reindex_for_setitem(value, index)
+  12672 # GH#4107
+  12673 try:
+> 12674     reindexed_value = value.reindex(index)._values
+  12675 except ValueError as err:
+  12676     # raised in MultiIndex.from_tuples, see test_insert_error_msmgs
+  12677     if not value.index.is_unique:
+  12678         # duplicate axis
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\series.py:5144, in Series.reindex(self, index, axis, method, copy, level, fill_value, limit, tolerance)
+   5127 @doc(
+   5128     NDFrame.reindex,  # type: ignore[has-type]
+   5129     klass=_shared_doc_kwargs["klass"],
+   (...)
+   5142     tolerance=None,
+   5143 ) -> Series:
+-> 5144     return super().reindex(
+   5145         index=index,
+   5146         method=method,
+   5147         copy=copy,
+   5148         level=level,
+   5149         fill_value=fill_value,
+   5150         limit=limit,
+   5151         tolerance=tolerance,
+   5152     )
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\generic.py:5607, in NDFrame.reindex(self, labels, index, columns, axis, method, copy, level, fill_value, limit, tolerance)
+   5604     return self._reindex_multi(axes, copy, fill_value)
+   5606 # perform the reindex on the axes
+-> 5607 return self._reindex_axes(
+   5608     axes, level, limit, tolerance, method, fill_value, copy
+   5609 ).__finalize__(self, method="reindex")
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\generic.py:5630, in NDFrame._reindex_axes(self, axes, level, limit, tolerance, method, fill_value, copy)
+   5627     continue
+   5629 ax = self._get_axis(a)
+-> 5630 new_index, indexer = ax.reindex(
+   5631     labels, level=level, limit=limit, tolerance=tolerance, method=method
+   5632 )
+   5634 axis = self._get_axis_number(a)
+   5635 obj = obj._reindex_with_indexers(
+   5636     {axis: [new_index, indexer]},
+   5637     fill_value=fill_value,
+   5638     copy=copy,
+   5639     allow_dups=False,
+   5640 )
+
+File c:\Users\manjanid\AppData\Local\miniconda3\envs\test_env\Lib\site-packages\pandas\core\indexes\base.py:4429, in Index.reindex(self, target, method, level, limit, tolerance)
+   4426     raise ValueError("cannot handle a non-unique multi-index!")
+   4427 elif not self.is_unique:
+   4428     # GH#42568
+-> 4429     raise ValueError("cannot reindex on an axis with duplicate labels")
+   4430 else:
+   4431     indexer, _ = self.get_indexer_non_unique(target)
+
+ValueError: cannot reindex on an axis with duplicate labels
