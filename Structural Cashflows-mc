@@ -1393,15 +1393,20 @@ for run_id in range(1, n_runs + 1):
                 rc_added = ledger.add_recallable(step, rc_amt_raw, enforce_cap=True)
 
             # ---- Endogenous NAV update ----
-            nav_after_flow = NAV_prev + float(draw_amt) - float(rep_regular)
-            nav_after_flow = max(nav_after_flow, 0.0)
+            available_nav = max(NAV_prev + float(draw_amt) - float(rep_regular), 0.0)
+            rep_terminal = 0.0
+            if RUNOFF_Q > 0 and q_left < RUNOFF_Q:
+                base_ratio = q_left / (q_left + 1.0)
+                target_nav = available_nav * (base_ratio ** max(runoff_mult, 0.0))
+                rep_terminal = max(0.0, available_nav - target_nav)
+
+            nav_after_flow = max(available_nav - rep_terminal, 0.0)
 
             nav_after_val = nav_after_flow * (1.0 + float(omega_t))
             if not np.isfinite(nav_after_val):
                 nav_after_val = 0.0
             nav_after_val = max(float(nav_after_val), 0.0)
 
-            rep_terminal = 0.0
             nav_end = nav_after_val
 
             if q_left == 0:
@@ -1597,6 +1602,7 @@ check_out.to_csv(check_csv, index=False)
 check_out.to_parquet(check_pq, index=False)
 print("Saved check:", check_csv)
 print("Saved check:", check_pq)
+
 
 
 
