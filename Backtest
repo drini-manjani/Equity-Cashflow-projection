@@ -1,7 +1,7 @@
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -832,6 +832,10 @@ def main():
 
     # Age buckets
     data["AgeBucket"] = pd.cut(data["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+    if "AgeBucket" not in train.columns:
+        train["AgeBucket"] = pd.cut(train["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+    if "AgeBucket" not in test.columns:
+        test["AgeBucket"] = pd.cut(test["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
 
     # Build MSCI lookup for conditional path
     msci_map = msci_q.set_index("quarter_end")["msci_ret_q"].to_dict()
