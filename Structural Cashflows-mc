@@ -1249,27 +1249,27 @@ for run_id in range(1, n_runs + 1):
                 row_out["sim_id"] = int(sim_label)
                 out.append(row_out)
 
-        # Build output dataframe
-        if N_SIM > 1:
-            rows = []
-            for key, sums in agg_sum.items():
-                cnt = agg_cnt.get(key, 1)
-                meta = agg_meta.get(key, {})
-                row = dict(meta)
-                for c in AVG_COLS:
-                    row[c] = sums[c] / float(cnt)
-                rows.append(row)
-            sim = pd.DataFrame(rows)
-        else:
-            sim = pd.DataFrame(out)
+# Build output dataframe
+if N_SIM > 1:
+    rows = []
+    for key, sums in agg_sum.items():
+        cnt = agg_cnt.get(key, 1)
+        meta = agg_meta.get(key, {})
+        row = dict(meta)
+        for c in AVG_COLS:
+            row[c] = sums[c] / float(cnt)
+        rows.append(row)
+    sim = pd.DataFrame(rows)
+else:
+    sim = pd.DataFrame(out)
 
-        if sim.empty or "FundID" not in sim.columns:
-            raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
+if sim.empty or "FundID" not in sim.columns:
+    raise ValueError("Simulation produced no rows. Check omega/nav_start overlap, cap_qe filters, and n_q.")
 
-        print("\nSimulated rows:", len(sim))
-        print("Simulated funds:", sim["FundID"].nunique())
-        if N_SIM > 1:
-            print("Structural MC sims:", N_SIM)
+print("\nSimulated rows:", len(sim))
+print("Simulated funds:", sim["FundID"].nunique())
+if N_SIM > 1:
+    print("Structural MC sims:", N_SIM)
 # =============================
 # Save
 # =============================
@@ -1376,6 +1376,7 @@ check_out.to_csv(check_csv, index=False)
 check_out.to_parquet(check_pq, index=False)
 print("Saved check:", check_csv)
 print("Saved check:", check_pq)
+
 
 
 
