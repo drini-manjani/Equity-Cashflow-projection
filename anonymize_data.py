@@ -65,9 +65,9 @@ def _write_any(df: pd.DataFrame, path: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="Input data file (.csv or .parquet)")
-    ap.add_argument("--output", required=True, help="Output anonymized file (.csv or .parquet)")
-    ap.add_argument("--map-out", default="", help="Optional fund name mapping output (.csv or .parquet)")
+    ap.add_argument("--input", default="data.csv", help="Input data file (.csv or .parquet). Default: data.csv")
+    ap.add_argument("--output", default="data_anonymized.csv", help="Output anonymized file (.csv or .parquet)")
+    ap.add_argument("--map-out", default="fund_map.csv", help="Fund name mapping output (.csv or .parquet)")
     args = ap.parse_args()
 
     df = _read_any(args.input)
@@ -109,16 +109,14 @@ def main() -> int:
 
     _write_any(out, args.output)
 
-    if args.map_out:
-        map_df = pd.DataFrame({"VC Fund Name": list(name_map.keys()),
-                               "Fund_Anon": list(name_map.values())})
-        _write_any(map_df, args.map_out)
+    map_df = pd.DataFrame({"VC Fund Name": list(name_map.keys()),
+                           "Fund_Anon": list(name_map.values())})
+    _write_any(map_df, args.map_out)
 
     print(f"Anonymized rows: {len(out)}")
     print(f"Unique funds: {len(name_map)}")
     print(f"Output: {args.output}")
-    if args.map_out:
-        print(f"Mapping file: {args.map_out}")
+    print(f"Mapping file: {args.map_out}")
     return 0
 
 
