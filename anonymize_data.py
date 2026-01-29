@@ -14,14 +14,14 @@ import pandas as pd
 
 
 TARGET_COLUMNS: List[str] = [
-    "VC Fund Name",
+    "FundID",
     "Year of Transaction Date",
-    "Quarter",
+    "Quarter of Transaction Date",
     "Adj strategy",
     "VC Fund Status",
-    "Fund Workflow",
+    "Fund Workflow Stage",
     "First Closing Date",
-    "Planned End Date",
+    "Planned end date with add. years as per legal doc",
     "Transaction Quarter",
     "Commitment EUR",
     "Signed Amount EUR",
@@ -151,9 +151,9 @@ def main() -> int:
     out.columns = TARGET_COLUMNS
 
     # anonymize fund names
-    fund_col = "VC Fund Name"
+    fund_col = "FundID"
     if fund_col not in out.columns:
-        raise KeyError("VC Fund Name column not found after normalization.")
+        raise KeyError("FundID column not found after normalization.")
 
     # preserve order of appearance (deterministic for a given file order)
     seen = []
@@ -167,7 +167,7 @@ def main() -> int:
 
     _write_any(out, output_path)
 
-    map_df = pd.DataFrame({"VC Fund Name": list(name_map.keys()),
+    map_df = pd.DataFrame({"FundID": list(name_map.keys()),
                            "Fund_Anon": list(name_map.values())})
     _write_any(map_df, map_path)
 
