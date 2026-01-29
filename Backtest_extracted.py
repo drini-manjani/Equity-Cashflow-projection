@@ -1829,6 +1829,10 @@ def main():
         if df_in is None or df_in.empty:
             print(f"[omega] {label}: no data")
             return
+        if "nav_prev" not in df_in.columns:
+            df_in = df_in.copy()
+            df_in = df_in.sort_values(["FundID", "quarter_end"])
+            df_in["nav_prev"] = df_in.groupby("FundID")["NAV Adjusted EUR"].shift(1)
         m = df_in["nav_prev"].abs() > NAV_EPS
         if "omega" not in df_in.columns:
             df_in = df_in.copy()
