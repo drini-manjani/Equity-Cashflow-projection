@@ -1,10 +1,6 @@
----------------------------------------------------------------------------
-NameError                                 Traceback (most recent call last)
-Cell In[3], line 902
-    899 # strategy/grade0 for reference (omega provides time-varying grade)
-    900 strat0 = ns["Adj Strategy"] if "Adj Strategy" in ns.index else omega_sim[omega_sim["FundID"] == fid]["Adj Strategy"].iloc[0]
---> 902 C = float(fund_commit.get(fid, 0.0) or 0.0)
-    903 C = max(C, 0.0)
-    905 rho, E = get_rho_E(fid, strat0)
-
-NameError: name 'fund_commit' is not defined
+Using single NAV Logic omega path; cashflow sims = 5.
+[omega] train_actual: mean=-0.0151 median=-0.0049 p10=-0.1420 p90=0.1295 n=5454
+[omega] test_actual: mean=-0.2629 median=0.0000 p10=-0.0910 p90=0.1222 n=20490
+[omega] model_input (omega_df): mean=-0.0110 median=-0.0101 p10=-0.2523 p90=0.2322 n=14043
+Warning: hazard model fit failed, falling back to group means: loop of ufunc does not support argument 0 of type float which has no callable exp method
+Running unconditional backtest (simulated MSCI)...
