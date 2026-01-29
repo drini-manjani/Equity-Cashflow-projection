@@ -1824,6 +1824,33 @@ def main():
     if cal.empty:
         raise ValueError("No omega calibration data after filtering.")
 
+    # Omega validation (train vs test, actual vs model input)
+    def _omega_stats(df_in: pd.DataFrame, label: str):
+        if df_in is None or df_in.empty:
+            print(f"[omega] {label}: no data")
+            return
+        m = df_in["nav_prev"].abs() > NAV_EPS
+        if "omega" not in df_in.columns:
+            df_in = df_in.copy()
+            df_in["flow_net"] = df_in["Adj Drawdown EUR"] - df_in["Adj Repayment EUR"]
+            df_in["omega"] = np.nan
+            df_in.loc[m, "omega"] = ((df_in.loc[m, "NAV Adjusted EUR"] - df_in.loc[m, "nav_prev"]) - df_in.loc[m, "flow_net"]) / df_in.loc[m, "nav_prev"]
+        w = df_in.loc[m, "omega"].dropna()
+        if w.empty:
+            print(f"[omega] {label}: no omega values")
+            return
+        print(f"[omega] {label}: mean={w.mean():.4f} median={w.median():.4f} p10={w.quantile(0.1):.4f} p90={w.quantile(0.9):.4f} n={len(w)}")
+
+    _omega_stats(train, "train_actual")
+    _omega_stats(test, "test_actual")
+
+    if USE_NAV_PROJECTIONS and omega_df is not None and not omega_df.empty:
+        om = omega_df["omega"].dropna()
+        if len(om):
+            print(f"[omega] model_input (omega_df): mean={om.mean():.4f} median={om.median():.4f} p10={om.quantile(0.1):.4f} p90={om.quantile(0.9):.4f} n={len(om)}")
+        else:
+            print("[omega] model_input (omega_df): no omega values")
+
     get_betas, get_alpha, get_sigma = build_omega_models(cal)
 
     # =============================
