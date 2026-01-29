@@ -1,16 +1,22 @@
 ---------------------------------------------------------------------------
 ValueError                                Traceback (most recent call last)
-Cell In[5], line 2170
-   2166     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
-   2169 if __name__ == "__main__":
--> 2170     main()
+Cell In[6], line 2201
+   2197     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
+   2200 if __name__ == "__main__":
+-> 2201     main()
 
-Cell In[5], line 965, in main()
-    962 omega_df = omega_df[(omega_df["quarter_end"] >= test_start_qe) &
-    963                     (omega_df["quarter_end"] <= test_end_qe)].copy()
-    964 if omega_df.empty:
---> 965     raise ValueError("omega_projection has no rows in the test window.")
-    967 sim_ids = sorted(omega_df["sim_id"].unique().tolist())
-    969 navstart = navstart.copy()
+Cell In[6], line 967, in main()
+    965 adj_end = min(test_end_qe, omega_max)
+    966 if adj_end < adj_start:
+--> 967     raise ValueError(
+    968         f"omega_projection has no overlap with test window. "
+    969         f"omega range: {omega_min.date()} to {omega_max.date()}, "
+    970         f"test window: {test_start_qe.date()} to {test_end_qe.date()}."
+    971     )
+    972 if adj_start != test_start_qe or adj_end != test_end_qe:
+    973     print(
+    974         "Adjusting test window to omega coverage:",
+    975         f"{test_start_qe.date()}–{test_end_qe.date()} -> {adj_start.date()}–{adj_end.date()}",
+    976     )
 
-ValueError: omega_projection has no rows in the test window.
+ValueError: omega_projection has no overlap with test window. omega range: 2025-12-31 to 2035-09-30, test window: 2018-06-30 to 2025-09-30.
