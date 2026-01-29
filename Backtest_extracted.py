@@ -88,8 +88,13 @@ USE_NAV_PROJECTIONS = True  # use NAV Logic omega/nav_start files if available
 RUN_NAV_LOGIC_INLINE = True  # run NAV Logic in-memory for backtest window (no file outputs)
 NAV_LOGIC_ALPHA_LEVEL = 0.10
 NAV_LOGIC_MIN_CLUSTERS = 8
-RUN_CONDITIONAL = True
-RUN_UNCONDITIONAL = False
+NAV_LOGIC_MSCI_MODE = "unconditional"  # "conditional" or "unconditional"
+RUN_CONDITIONAL = False
+RUN_UNCONDITIONAL = True
+
+# Calibration / reporting bucketing
+CALIBRATION_BUCKET_MODE = "strategy_grade"  # "strategy_grade_age" or "strategy_grade"
+REPORT_BUCKET_MODE = "strategy_grade"       # "strategy_grade_age", "strategy_grade", or "strategy"
 
 GRADE_P_MULT = {"A": 1.15, "B": 1.00, "C": 0.85, "D": 0.70}
 GRADE_SIZE_MULT = {"A": 1.10, "B": 1.00, "C": 0.90, "D": 0.80}
@@ -1572,17 +1577,29 @@ def main():
             msci_q = msci_q.sort_values("quarter_end").reset_index(drop=True)
             msci_q["msci_ret_q_lag1"] = msci_q["msci_ret_q"].shift(1)
 
-            # Build MSCI history + future for NAV Logic (conditional backtest)
+            # Build MSCI history + future for NAV Logic
             start_qe = train_end_qe
             msci_hist_inline = msci_q[msci_q["quarter_end"] <= start_qe].copy()
             last_hist_ret = msci_hist_inline["msci_ret_q"].tail(1)
             last_hist_ret_val = float(last_hist_ret.iloc[0]) if len(last_hist_ret) else 0.0
+            if NAV_LOGIC_MSCI_MODE == "unconditional":
+                rng_nav = np.random.default_rng(seed)
+                msci_future = simulate_msci_path(
+                    msci_q[msci_q["quarter_end"] <= start_qe],
+                    start_qe=start_qe,
+                    n_quarters=len(test_quarters),
+                    scenario=scenario_uncond,
+                    tilt_strength=tilt_strength,
+                    rng=rng_nav,
+                )
+                msci_future = msci_future.sort_values("quarter_end").reset_index(drop=True)
+            else:
+                msci_future = msci_q[(msci_q["quarter_end"] > start_qe) &
+                                     (msci_q["quarter_end"] <= test_end_qe)].copy()
+                if len(msci_future) != len(test_quarters):
+                    raise ValueError("MSCI history does not fully cover the backtest window.")
+                msci_future = msci_future.sort_values("quarter_end").reset_index(drop=True)
 
-            msci_future = msci_q[(msci_q["quarter_end"] > start_qe) &
-                                 (msci_q["quarter_end"] <= test_end_qe)].copy()
-            if len(msci_future) != len(test_quarters):
-                raise ValueError("MSCI history does not fully cover the backtest window.")
-            msci_future = msci_future.sort_values("quarter_end").reset_index(drop=True)
             msci_future["msci_ret_q_lag1"] = msci_future["msci_ret_q"].shift(1)
             if len(msci_future):
                 msci_future.loc[0, "msci_ret_q_lag1"] = last_hist_ret_val
@@ -1761,6 +1778,12 @@ def main():
     if "AgeBucket" not in test.columns:
         test["AgeBucket"] = pd.cut(test["age_q_model"], bins=AGE_BINS_Q, labels=AGE_LABELS)
 
+    # Calibration bucketing (optionally collapse age buckets)
+    if CALIBRATION_BUCKET_MODE == "strategy_grade":
+        train["AgeBucketCalib"] = "ALL"
+    else:
+        train["AgeBucketCalib"] = train["AgeBucket"].astype(str)
+
     # Build MSCI lookup for conditional path
     msci_map = msci_q.set_index("quarter_end")["msci_ret_q"].to_dict()
     msci_lag_map = msci_q.set_index("quarter_end")["msci_ret_q_lag1"].to_dict()
@@ -1884,7 +1907,7 @@ def main():
     train.loc[train["rc_ratio_given_rep"] <= 0, "rc_ratio_given_rep"] = np.nan
 
     # Calibration tables
-    group_keys = ["Adj Strategy", "Grade", "AgeBucket"]
+    group_keys = ["Adj Strategy", "Grade", "AgeBucketCalib"]
     rows = []
     for (s, g, a), grp in train.groupby(group_keys, dropna=False):
         p_draw = float(grp["draw_event"].mean()) if len(grp) else 0.0
@@ -1961,7 +1984,7 @@ def main():
 
     # strategy + age fallback
     rows_sa = []
-    for (s, a), grp in train.groupby(["Adj Strategy", "AgeBucket"], dropna=False):
+    for (s, a), grp in train.groupby(["Adj Strategy", "AgeBucketCalib"], dropna=False):
         p_draw = float(grp["draw_event"].mean()) if len(grp) else 0.0
         p_rep = float(grp["rep_event"].mean()) if len(grp) else 0.0
         rep_q = grp[grp["Adj Repayment EUR"] > 0]
@@ -1996,7 +2019,8 @@ def main():
     }
 
     def lookup_params(strategy, grade, age_bucket) -> Dict[str, float]:
-        m = (cal["Adj Strategy"].eq(strategy)) & (cal["Grade"].eq(grade)) & (cal["AgeBucket"].eq(age_bucket))
+        age_bucket_calib = "ALL" if CALIBRATION_BUCKET_MODE == "strategy_grade" else age_bucket
+        m = (cal["Adj Strategy"].eq(strategy)) & (cal["Grade"].eq(grade)) & (cal["AgeBucket"].eq(age_bucket_calib))
         child = cal[m].iloc[0].to_dict() if m.any() else {}
 
         ss = cal_s[cal_s["Adj Strategy"].eq(strategy)]
@@ -2005,7 +2029,7 @@ def main():
         ssg = cal_sg[(cal_sg["Adj Strategy"].eq(strategy)) & (cal_sg["Grade"].eq(grade))]
         parent_sg = ssg.iloc[0].to_dict() if len(ssg) else {}
 
-        ssa = cal_sa[(cal_sa["Adj Strategy"].eq(strategy)) & (cal_sa["AgeBucket"].eq(age_bucket))]
+        ssa = cal_sa[(cal_sa["Adj Strategy"].eq(strategy)) & (cal_sa["AgeBucket"].eq(age_bucket_calib))]
         parent_sa = ssa.iloc[0].to_dict() if len(ssa) else {}
 
         p_s = float(np.clip(parent_s.get("p_draw", global_p_draw), 0.0, 1.0))
@@ -2389,7 +2413,12 @@ def main():
 
         # bucket (based on start grade/age)
         age_bucket0 = make_age_bucket_q(age0)
-        bucket_key = (strategy, grade0, str(age_bucket0))
+        if REPORT_BUCKET_MODE == "strategy":
+            bucket_key = (strategy, "ALL", "ALL")
+        elif REPORT_BUCKET_MODE == "strategy_grade":
+            bucket_key = (strategy, grade0, "ALL")
+        else:
+            bucket_key = (strategy, grade0, str(age_bucket0))
         fund_bucket[fid] = bucket_key
 
         fund_states[fid] = {
