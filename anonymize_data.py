@@ -44,11 +44,23 @@ def _norm_key(s: str) -> str:
     return " ".join(s.strip().lower().replace("_", " ").split())
 
 
-def _read_any(path: str) -> pd.DataFrame:
+def _read_any(path: str, sep: str = "", encoding: str = "utf-8", bad_lines: str = "warn") -> pd.DataFrame:
     if path.lower().endswith(".parquet"):
         return pd.read_parquet(path)
     if path.lower().endswith(".csv"):
-        return pd.read_csv(path)
+        # Try robust CSV parsing (auto-detect delimiter, tolerant to bad lines)
+        if not sep:
+            try:
+                return pd.read_csv(path, sep=None, engine="python", encoding=encoding, on_bad_lines=bad_lines)
+            except Exception:
+                pass
+            # Fallback delimiters
+            for s in [",", ";", "\t", "|"]:
+                try:
+                    return pd.read_csv(path, sep=s, engine="python", encoding=encoding, on_bad_lines=bad_lines)
+                except Exception:
+                    continue
+        return pd.read_csv(path, sep=sep, engine="python", encoding=encoding, on_bad_lines=bad_lines)
     raise ValueError("Unsupported input type. Use .csv or .parquet")
 
 
@@ -89,6 +101,10 @@ def main() -> int:
     ap.add_argument("--input", default="", help="Input data file (.csv or .parquet). Default: auto-detect")
     ap.add_argument("--output", default="", help="Output anonymized file (.csv or .parquet). Default: alongside input")
     ap.add_argument("--map-out", default="", help="Fund name mapping output (.csv or .parquet). Default: alongside input")
+    ap.add_argument("--sep", default="", help="CSV separator (leave blank to auto-detect)")
+    ap.add_argument("--encoding", default="utf-8", help="CSV encoding (default: utf-8)")
+    ap.add_argument("--bad-lines", default="warn", choices=["error", "warn", "skip"],
+                    help="How to handle bad CSV lines (default: warn)")
     # In notebooks/IDEs, extra args may be injected (e.g., -f). Ignore unknowns.
     args, unknown = ap.parse_known_args()
     if unknown:
@@ -112,7 +128,7 @@ def main() -> int:
     else:
         map_path = os.path.join(os.path.dirname(input_path), "fund_map.csv")
 
-    df = _read_any(input_path)
+    df = _read_any(input_path, sep=args.sep, encoding=args.encoding, bad_lines=args.bad_lines)
     # normalize column names for matching
     col_map = {_norm_key(c): c for c in df.columns}
 
