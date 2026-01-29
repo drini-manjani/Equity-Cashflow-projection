@@ -852,7 +852,7 @@ def main():
     # Age in quarters since first close (Q2 for vintage handled upstream in data prep)
     p_qe = pd.PeriodIndex(data["quarter_end"], freq="Q")
     p_fc = pd.PeriodIndex(data["first_close_qe"], freq="Q")
-    data["age_q_fc"] = (p_qe.ordinal - p_fc.ordinal).astype(int)
+    data["age_q_fc"] = (p_qe.astype("int64") - p_fc.astype("int64")).astype(int)
     data.loc[data["age_q_fc"] < 0, "age_q_fc"] = 0
     data["age_q_model"] = pd.to_numeric(data["age_q_fc"], errors="coerce").fillna(0.0)
 
