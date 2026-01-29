@@ -945,7 +945,7 @@ def main():
             raise ValueError(f"nav_start must contain columns: {need_ns}")
 
         omega_df = omega_df.copy()
-        omega_df["quarter_end"] = pd.to_datetime(omega_df["quarter_end"])
+        omega_df["quarter_end"] = pd.to_datetime(omega_df["quarter_end"]).dt.to_period("Q").dt.to_timestamp("Q")
         omega_df["omega"] = pd.to_numeric(omega_df["omega"], errors="coerce").fillna(0.0)
         if "msci_ret_q" in omega_df.columns:
             omega_df["msci_ret_q"] = pd.to_numeric(omega_df["msci_ret_q"], errors="coerce").fillna(0.0)
@@ -958,11 +958,42 @@ def main():
             omega_df["sim_id"] = 1
         omega_df["sim_id"] = pd.to_numeric(omega_df["sim_id"], errors="coerce").fillna(1).astype(int)
 
-        # restrict to test window
+        # align test window to omega coverage if needed
+        omega_min = omega_df["quarter_end"].min()
+        omega_max = omega_df["quarter_end"].max()
+        adj_start = max(test_start_qe, omega_min)
+        adj_end = min(test_end_qe, omega_max)
+        if adj_end < adj_start:
+            raise ValueError(
+                f"omega_projection has no overlap with test window. "
+                f"omega range: {omega_min.date()} to {omega_max.date()}, "
+                f"test window: {test_start_qe.date()} to {test_end_qe.date()}."
+            )
+        if adj_start != test_start_qe or adj_end != test_end_qe:
+            print(
+                "Adjusting test window to omega coverage:",
+                f"{test_start_qe.date()}–{test_end_qe.date()} -> {adj_start.date()}–{adj_end.date()}",
+            )
+            test_start_qe = adj_start
+            test_end_qe = adj_end
+            test_quarters = quarter_range(test_start_qe, test_end_qe)
+            if not test_quarters:
+                raise ValueError("Adjusted test window has no quarters.")
+
+        # restrict to (possibly adjusted) test window
         omega_df = omega_df[(omega_df["quarter_end"] >= test_start_qe) &
                             (omega_df["quarter_end"] <= test_end_qe)].copy()
-        if omega_df.empty:
-            raise ValueError("omega_projection has no rows in the test window.")
+
+        # ensure omega has every quarter in the test window
+        omega_quarters = set(omega_df["quarter_end"].unique())
+        missing_q = [qe for qe in test_quarters if qe not in omega_quarters]
+        if missing_q:
+            miss = ", ".join([d.strftime("%Y-%m-%d") for d in missing_q[:8]])
+            extra = "" if len(missing_q) <= 8 else f" (+{len(missing_q) - 8} more)"
+            raise ValueError(
+                "omega_projection is missing quarters inside the test window: "
+                f"{miss}{extra}. Align omega projection or adjust test dates."
+            )
 
         sim_ids = sorted(omega_df["sim_id"].unique().tolist())
 
