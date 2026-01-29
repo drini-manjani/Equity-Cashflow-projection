@@ -1,15 +1,16 @@
 ---------------------------------------------------------------------------
 ValueError                                Traceback (most recent call last)
-Cell In[2], line 1992
-   1988     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
-   1991 if __name__ == "__main__":
--> 1992     main()
+Cell In[5], line 2170
+   2166     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
+   2169 if __name__ == "__main__":
+-> 2170     main()
 
-Cell In[2], line 723, in main()
-    720 year = int(input("Enter year (e.g. 2025): ").strip())
-    721 quarter = input("Enter quarter (Q1, Q2, Q3, Q4): ").strip().upper()
---> 723 train_year = int(input("Train end year (e.g. 2018): ").strip())
-    724 train_quarter = input("Train end quarter (Q1, Q2, Q3, Q4): ").strip().upper()
-    726 test_year = input("Test end year (blank => max in data): ").strip()
+Cell In[5], line 965, in main()
+    962 omega_df = omega_df[(omega_df["quarter_end"] >= test_start_qe) &
+    963                     (omega_df["quarter_end"] <= test_end_qe)].copy()
+    964 if omega_df.empty:
+--> 965     raise ValueError("omega_projection has no rows in the test window.")
+    967 sim_ids = sorted(omega_df["sim_id"].unique().tolist())
+    969 navstart = navstart.copy()
 
-ValueError: invalid literal for int() with base 10: ''
+ValueError: omega_projection has no rows in the test window.
