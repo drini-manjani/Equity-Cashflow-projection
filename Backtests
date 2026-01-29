@@ -115,6 +115,15 @@ GRADE_STATES = ["A", "B", "C", "D"]
 OMEGA_CLIP = 0.8
 GRADE_OMEGA_BIAS = {"A": 0.005, "B": 0.0, "C": -0.005, "D": -0.01}
 
+# -----------------------------
+# Calibration controls
+# -----------------------------
+USE_DRAWDOWN_CALIBRATION = True
+# "mean", "median", or "auto" (pick lower SSE per group)
+DRAW_CALIB_TARGET = "auto"
+DRAW_CALIB_MIN_FUNDS = 10
+DRAW_CALIB_MIN_AGES = 8
+
 
 # -----------------------------
 # Helpers: math / distributions
@@ -826,6 +835,27 @@ def main():
     ).to_timestamp("Q")
     data = data.sort_values(["FundID", "quarter_end"]).reset_index(drop=True)
 
+    # First closing date (age baseline) if available; fallback to first observed quarter_end
+    first_close_col = None
+    for key, col in col_by_key.items():
+        if "first closing" in key:
+            first_close_col = col
+            break
+    if first_close_col is not None:
+        data["first_close_qe"] = pd.to_datetime(data[first_close_col], errors="coerce").dt.to_period("Q").dt.to_timestamp("Q")
+    else:
+        data["first_close_qe"] = pd.NaT
+    fc_map = data.groupby("FundID")["first_close_qe"].min()
+    fallback_fc = data.groupby("FundID")["quarter_end"].min()
+    fc_map = fc_map.fillna(fallback_fc)
+    data["first_close_qe"] = data["FundID"].map(fc_map)
+    # Age in quarters since first close (Q2 for vintage handled upstream in data prep)
+    p_qe = pd.PeriodIndex(data["quarter_end"], freq="Q")
+    p_fc = pd.PeriodIndex(data["first_close_qe"], freq="Q")
+    data["age_q_fc"] = (p_qe.ordinal - p_fc.ordinal).astype(int)
+    data.loc[data["age_q_fc"] < 0, "age_q_fc"] = 0
+    data["age_q_model"] = pd.to_numeric(data["age_q_fc"], errors="coerce").fillna(0.0)
+
     train_end_qe = quarter_end_from_year_quarter(train_year, train_quarter)
     test_start_qe = add_quarters(train_end_qe, 1)
 
@@ -885,11 +915,11 @@ def main():
                    .groupby("FundID")["planned_end_qe"].last().to_dict())
 
     # Age buckets
-    data["AgeBucket"] = pd.cut(data["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+    data["AgeBucket"] = pd.cut(data["age_q_model"], bins=AGE_BINS_Q, labels=AGE_LABELS)
     if "AgeBucket" not in train.columns:
-        train["AgeBucket"] = pd.cut(train["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+        train["AgeBucket"] = pd.cut(train["age_q_model"], bins=AGE_BINS_Q, labels=AGE_LABELS)
     if "AgeBucket" not in test.columns:
-        test["AgeBucket"] = pd.cut(test["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+        test["AgeBucket"] = pd.cut(test["age_q_model"], bins=AGE_BINS_Q, labels=AGE_LABELS)
 
     # Build MSCI lookup for conditional path
     msci_map = msci_q.set_index("quarter_end")["msci_ret_q"].to_dict()
@@ -931,9 +961,9 @@ def main():
     # =============================
     # investment period calibration by strategy
     ip_by_strategy = {}
-    df_ip = train[(train["Adj Drawdown EUR"] > 0) & train["Adj Strategy"].notna() & train["Fund_Age_Quarters"].notna()].copy()
+    df_ip = train[(train["Adj Drawdown EUR"] > 0) & train["Adj Strategy"].notna() & train["age_q_model"].notna()].copy()
     if len(df_ip):
-        df_ip["age_q"] = pd.to_numeric(df_ip["Fund_Age_Quarters"], errors="coerce").round().astype("Int64")
+        df_ip["age_q"] = pd.to_numeric(df_ip["age_q_model"], errors="coerce").round().astype("Int64")
         df_ip = df_ip[df_ip["age_q"].notna() & (df_ip["age_q"] >= 0)]
         for strat, g in df_ip.groupby("Adj Strategy", dropna=False):
             s = g.groupby("age_q")["Adj Drawdown EUR"].sum().sort_index()
@@ -948,7 +978,7 @@ def main():
 
     # hazard dataset
     haz = train.copy()
-    haz["age_q"] = pd.to_numeric(haz["Fund_Age_Quarters"], errors="coerce").round()
+    haz["age_q"] = pd.to_numeric(haz["age_q_model"], errors="coerce").round()
     haz = haz[haz["age_q"].notna()].copy()
     haz["age_q"] = haz["age_q"].astype(int)
     haz["log_nav_prev"] = np.log1p(haz["nav_prev"].abs().fillna(0.0))
@@ -1245,6 +1275,145 @@ def main():
             "mu_rc": float(mu_rc), "sig_rc": float(sig_rc),
         }
 
+    # =============================
+    # Drawdown scaling calibration (censored funds, by strategy+grade)
+    # =============================
+    draw_scale_sg = {}
+    draw_scale_s = {}
+    draw_scale_g = 1.0
+
+    def build_cum_draw_obs(df: pd.DataFrame, fund_commit: dict) -> pd.DataFrame:
+        rows = []
+        for fid, g in df.groupby("FundID"):
+            C = float(fund_commit.get(fid, 0.0) or 0.0)
+            if not np.isfinite(C) or C <= 0:
+                continue
+            g2 = g.sort_values("age_q_fc")
+            g2 = (g2.groupby("age_q_fc", as_index=False)
+                    .agg(draw=("Adj Drawdown EUR", "sum"),
+                         **{"Adj Strategy": ("Adj Strategy", "last"),
+                            "Grade": ("Grade", "last")}))
+            g2["cum_draw"] = g2["draw"].cumsum()
+            g2["ratio"] = g2["cum_draw"] / C
+            g2["Adj Strategy"] = g2["Adj Strategy"].fillna("Unknown")
+            g2["Grade"] = g2["Grade"].fillna("D").astype(str).str.strip()
+            g2["FundID"] = fid
+            rows.append(g2[["FundID", "Adj Strategy", "Grade", "age_q_fc", "ratio"]])
+        if not rows:
+            return pd.DataFrame(columns=["FundID", "Adj Strategy", "Grade", "age_q_fc", "ratio"])
+        return pd.concat(rows, ignore_index=True)
+
+    def expected_draw_increment(strategy: str, grade: str, age_q: int) -> float:
+        age_bucket = make_age_bucket_q(age_q)
+        ip_q = int(ip_by_strategy.get(strategy, IP_Q_DEFAULT))
+        draw_mult = 1.0
+        if USE_DRAW_AGE_SHAPE and ip_q > 0:
+            if ENFORCE_IP_LIMITS and age_q > ip_q:
+                draw_mult = 0.0
+            else:
+                frac = float(age_q) / float(ip_q)
+                draw_mult = max(DRAW_AGE_MIN_MULT, (1.0 - frac) ** DRAW_AGE_DECAY_POWER)
+
+        params = lookup_params(strategy, grade, age_bucket)
+        if USE_HAZARD_MODELS and beta_draw is not None:
+            Xr = build_feature_row(strategy, grade, age_q, 0.0, False,
+                                   hazard_meta["draw_cols"], hazard_meta["draw_means"], hazard_meta["draw_stds"])
+            p_draw_base = float(_sigmoid(Xr @ beta_draw)[0])
+        else:
+            p_draw_base = float(params.get("p_draw", 0.0))
+
+        grade_key = grade if grade in GRADE_DRAW_P_MULT else "D"
+        p_draw_adj = p_draw_base * draw_mult * float(GRADE_DRAW_P_MULT.get(grade_key, 1.0))
+        p_draw_adj = min(p_draw_adj, 1.0)
+
+        mu = float(params.get("mu_draw", 0.0))
+        sig = float(params.get("sig_draw", SIGMA_FLOOR))
+        mean_ratio = float(np.exp(mu + 0.5 * sig * sig))
+        mean_ratio = min(mean_ratio * float(GRADE_DRAW_SIZE_MULT.get(grade_key, 1.0)), 1.0)
+        return float(p_draw_adj * mean_ratio)
+
+    def baseline_curve(strategy: str, grade: str, ages: List[int]) -> np.ndarray:
+        ages_sorted = sorted(set(int(a) for a in ages))
+        out = []
+        cum = 0.0
+        for a in ages_sorted:
+            cum += expected_draw_increment(strategy, grade, a)
+            out.append(cum)
+        return np.array(out, dtype=float), ages_sorted
+
+    def fit_scale_for_group(grp: pd.DataFrame, target_col: str) -> Tuple[float, float]:
+        ages = grp["age_q_fc"].astype(int).tolist()
+        base, ages_sorted = baseline_curve(grp["Adj Strategy"].iloc[0], grp["Grade"].iloc[0], ages)
+        g2 = grp.set_index("age_q_fc").loc[ages_sorted]
+        target = g2[target_col].to_numpy(dtype=float)
+        weights = g2["n_funds"].to_numpy(dtype=float)
+        denom = float(np.sum(weights * base * base))
+        if denom <= 0:
+            return 1.0, float("inf")
+        scale_raw = float(np.sum(weights * target * base) / denom)
+        n_funds = float(g2["n_funds"].max())
+        w_shrink = n_funds / (n_funds + SHRINK_FUNDS)
+        scale = 1.0 + w_shrink * (scale_raw - 1.0)
+        sse = float(np.sum(weights * (scale * base - target) ** 2))
+        return max(scale, 0.0), sse
+
+    if USE_DRAWDOWN_CALIBRATION:
+        obs = build_cum_draw_obs(train, fund_commit)
+        if len(obs):
+            curves_sg = (obs.groupby(["Adj Strategy", "Grade", "age_q_fc"])
+                            .agg(mean_ratio=("ratio", "mean"),
+                                 median_ratio=("ratio", "median"),
+                                 n_funds=("FundID", "nunique"))
+                            .reset_index())
+            curves_s = (obs.groupby(["Adj Strategy", "age_q_fc"])
+                           .agg(mean_ratio=("ratio", "mean"),
+                                median_ratio=("ratio", "median"),
+                                n_funds=("FundID", "nunique"))
+                           .reset_index())
+            # strategy+grade
+            for (s, g), grp in curves_sg.groupby(["Adj Strategy", "Grade"]):
+                g2 = grp[grp["n_funds"] >= DRAW_CALIB_MIN_FUNDS]
+                if len(g2) < DRAW_CALIB_MIN_AGES:
+                    continue
+                scale_mean, sse_mean = fit_scale_for_group(g2, "mean_ratio")
+                scale_med, sse_med = fit_scale_for_group(g2, "median_ratio")
+                if DRAW_CALIB_TARGET == "mean":
+                    draw_scale_sg[(s, g)] = scale_mean
+                elif DRAW_CALIB_TARGET == "median":
+                    draw_scale_sg[(s, g)] = scale_med
+                else:
+                    draw_scale_sg[(s, g)] = scale_mean if sse_mean <= sse_med else scale_med
+
+            # strategy fallback: weighted average of grade-level scales
+            for s, grp in curves_sg.groupby(["Adj Strategy"]):
+                scales = []
+                for g in grp["Grade"].unique():
+                    key = (s, g)
+                    if key in draw_scale_sg:
+                        n_funds = float(grp[grp["Grade"] == g]["n_funds"].max())
+                        scales.append((draw_scale_sg[key], n_funds))
+                if scales:
+                    wsum = sum(w for _, w in scales)
+                    if wsum > 0:
+                        draw_scale_s[s] = sum(scale * w for scale, w in scales) / wsum
+
+            # global fallback: weighted average of strategy scales
+            if draw_scale_s:
+                wsum = 0.0
+                tot = 0.0
+                for s, scale in draw_scale_s.items():
+                    n_funds = float(curves_s[curves_s["Adj Strategy"] == s]["n_funds"].max())
+                    if not np.isfinite(n_funds) or n_funds <= 0:
+                        continue
+                    wsum += n_funds
+                    tot += scale * n_funds
+                if wsum > 0:
+                    draw_scale_g = tot / wsum
+
+            print(f"Drawdown calibration: sg_scales={len(draw_scale_sg)}, "
+                  f"s_scales={len(draw_scale_s)}, global_scale={round(draw_scale_g, 4)} "
+                  f"(target={DRAW_CALIB_TARGET})")
+
     # Runoff calibration
     runoff_mult_by_strategy = {}
     if USE_RUNOFF_CALIBRATION:
@@ -1343,7 +1512,7 @@ def main():
         grade0 = str(last.get("Grade") or "D").strip()
         if grade0 not in GRADE_STATES:
             grade0 = "D"
-        age0 = int(round(float(last.get("Fund_Age_Quarters") or 0.0)))
+        age0 = int(round(float(last.get("age_q_model") or 0.0)))
         nav0 = float(last.get("NAV Adjusted EUR") or 0.0)
 
         fund_start_qe[fid] = hist["quarter_end"].iloc[0]
@@ -1493,6 +1662,7 @@ def main():
                     "age0": st0["age0"],
                     "nav": float(st0["nav"]),
                     "dd_commit": float(st0["dd_commit"]),
+                    "ip_catchup_done": False,
                     "ledger": RecallableLedger(
                         rho=st0["ledger"].rho,
                         expiry_quarters=st0["ledger"].expiry_quarters,
@@ -1579,18 +1749,31 @@ def main():
                         ratio = lognormal_from_u(params["mu_draw"], params["sig_draw"], float(U["draw_size"][i]))
                         ratio = float(np.clip(ratio, 0.0, 1.0))
                         ratio = min(ratio * float(GRADE_DRAW_SIZE_MULT.get(grade_key, 1.0)), 1.0)
+                        if USE_DRAWDOWN_CALIBRATION:
+                            scale = draw_scale_sg.get((strategy, grade),
+                                                      draw_scale_s.get(strategy, draw_scale_g))
+                            ratio = ratio * float(scale)
+                        ratio = float(np.clip(ratio, 0.0, 1.0))
                         draw_amt = ratio * capacity_pre
                         cons = ledger.consume_for_drawdown(step, draw_amt)
                         use_rc = cons["use_rc"]
                         use_commit = cons["use_commitment"]
                         st["dd_commit"] += use_commit
 
-                    if ENFORCE_IP_LIMITS and age_q == ip_q:
+                    # Force full commitment deployment by end of IP, plus any available recallables
+                    if (not st["ip_catchup_done"]) and (age_q >= ip_q):
                         remaining_commit_after = max(st["commitment"] - st["dd_commit"], 0.0)
                         if remaining_commit_after > 0.0:
                             draw_amt += remaining_commit_after
                             st["dd_commit"] += remaining_commit_after
                             draw_event = True
+                        rc_avail_after = ledger.available(step)
+                        if rc_avail_after > 0.0:
+                            cons2 = ledger.consume_for_drawdown(step, rc_avail_after)
+                            draw_amt += cons2["use_rc"] + cons2["use_commitment"]
+                            st["dd_commit"] += cons2["use_commitment"]
+                            draw_event = True
+                        st["ip_catchup_done"] = True
 
                     # repayment
                     NAV_prev = float(st["nav"])
