@@ -85,6 +85,11 @@ USE_DRAW_AGE_SHAPE = False
 USE_FORCED_TERMINAL_REPAY = False
 AGE_SOURCE = "fund_age"  # "fund_age" or "first_close"
 USE_NAV_PROJECTIONS = True  # use NAV Logic omega/nav_start files if available
+RUN_NAV_LOGIC_INLINE = True  # run NAV Logic in-memory for backtest window (no file outputs)
+NAV_LOGIC_ALPHA_LEVEL = 0.10
+NAV_LOGIC_MIN_CLUSTERS = 8
+RUN_CONDITIONAL = True
+RUN_UNCONDITIONAL = False
 
 GRADE_P_MULT = {"A": 1.15, "B": 1.00, "C": 0.85, "D": 0.70}
 GRADE_SIZE_MULT = {"A": 1.10, "B": 1.00, "C": 0.90, "D": 0.80}
@@ -716,16 +721,643 @@ def build_omega_models(cal: pd.DataFrame) -> Tuple[Dict[Tuple[str, str], Tuple[f
 
 
 # -----------------------------
+# NAV Logic inline (no file outputs)
+# -----------------------------
+
+def run_nav_logic_inline(
+    data: pd.DataFrame,
+    msci_hist: pd.DataFrame,
+    msci_future: pd.DataFrame,
+    start_qe: pd.Timestamp,
+    data_dir: str,
+    alpha_level: float = 0.10,
+    min_clusters_for_inference: int = 8,
+    seed: int = 1234,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # Keep methodology aligned with NAV Logic.ipynb
+    try:
+        from scipy import stats  # noqa: F401
+    except Exception as e:
+        raise ImportError("scipy is required for NAV Logic inline runs.") from e
+
+    NAV_COL = "NAV Adjusted EUR"
+    DRAW_COL = "Adj Drawdown EUR"
+    REPAY_COL = "Adj Repayment EUR"
+    SIZE_COL = "Target Fund Size"
+
+    NAV_EPS = 100.0
+    OMEGA_CLIP = 0.8
+    GRADE_OMEGA_BIAS = {"A": 0.005, "B": 0.0, "C": -0.005, "D": -0.01}
+
+    MIN_FUNDS_BETA = 10
+    MIN_OBS_BETA = 80
+    MIN_FUNDS_ALPHA_BUCKET = 6
+    MIN_OBS_ALPHA_BUCKET = 60
+    SIGMA_SHRINK_K = 120.0
+    DRAW_EPS = 1000.0
+    SIZE_EPS = 1e6
+    MIN_OBS_RATIO = 50
+
+    df = data.copy()
+    df["quarter_end"] = pd.to_datetime(df["quarter_end"]).dt.to_period("Q").dt.to_timestamp("Q")
+    df = df.sort_values(["FundID", "quarter_end"]).reset_index(drop=True)
+
+    required_cols = [
+        "FundID", "quarter_end",
+        NAV_COL, DRAW_COL, REPAY_COL,
+        "Adj Strategy", "Grade",
+        SIZE_COL, "Fund_Age_Quarters",
+        "Planned end date with add. years as per legal doc",
+    ]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in data for NAV Logic inline: {missing}")
+
+    df["planned_end_qe"] = pd.to_datetime(
+        df["Planned end date with add. years as per legal doc"],
+        errors="coerce"
+    ).dt.to_period("Q").dt.to_timestamp("Q")
+
+    df[NAV_COL] = pd.to_numeric(df[NAV_COL], errors="coerce")
+    for c in [DRAW_COL, REPAY_COL, SIZE_COL, "Fund_Age_Quarters"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+    # MSCI history (ensure lag exists)
+    msci_hist = msci_hist.copy()
+    msci_hist["quarter_end"] = pd.to_datetime(msci_hist["quarter_end"]).dt.to_period("Q").dt.to_timestamp("Q")
+    if "msci_ret_q_lag1" not in msci_hist.columns:
+        msci_hist["msci_ret_q_lag1"] = msci_hist["msci_ret_q"].shift(1)
+
+    # MSCI future map (single path)
+    msci_future = msci_future.copy()
+    msci_future["quarter_end"] = pd.to_datetime(msci_future["quarter_end"]).dt.to_period("Q").dt.to_timestamp("Q")
+    if "msci_ret_q_lag1" not in msci_future.columns:
+        msci_future["msci_ret_q_lag1"] = msci_future["msci_ret_q"].shift(1)
+
+    msci_future_map = {1: msci_future}
+    future_qe_max = msci_future["quarter_end"].iloc[-1]
+
+    # Planned end overrun by strategy (history-based)
+    last_obs = df.groupby("FundID")["quarter_end"].max().rename("last_qe")
+    fund_static = df.sort_values(["FundID", "quarter_end"]).groupby("FundID").tail(1).copy()
+    fund_static = fund_static.merge(last_obs, on="FundID", how="left")
+
+    def quarters_diff(a: pd.Timestamp, b: pd.Timestamp) -> float:
+        if pd.isna(a) or pd.isna(b):
+            return np.nan
+        return float(pd.Period(a, freq="Q").ordinal - pd.Period(b, freq="Q").ordinal)
+
+    fund_static["overrun_q"] = fund_static.apply(
+        lambda r: max(quarters_diff(r["last_qe"], r["planned_end_qe"]), 0.0)
+        if pd.notna(r["planned_end_qe"]) else np.nan,
+        axis=1
+    )
+
+    fund_static["ever_overran"] = fund_static["overrun_q"].fillna(0) > 0
+    ever_overran_map = fund_static.set_index("FundID")["ever_overran"]
+    overran_only = fund_static.loc[fund_static["overrun_q"].notna() & (fund_static["overrun_q"] > 0)].copy()
+    avg_overrun_by_strategy = overran_only.groupby("Adj Strategy")["overrun_q"].mean().clip(lower=0.0)
+
+    # Build omega from history for calibration
+    df["nav_prev"] = df.groupby("FundID")[NAV_COL].shift(1)
+    df["flow_net"] = df[DRAW_COL] - df[REPAY_COL]
+    m = df["nav_prev"].abs() > NAV_EPS
+    df["omega"] = np.nan
+    df.loc[m, "omega"] = ((df.loc[m, NAV_COL] - df.loc[m, "nav_prev"]) - df.loc[m, "flow_net"]) / df.loc[m, "nav_prev"]
+    df["omega"] = df["omega"].clip(lower=-OMEGA_CLIP, upper=OMEGA_CLIP)
+
+    cal = df.merge(msci_hist, on="quarter_end", how="left")
+    cal = cal.dropna(subset=["omega", "msci_ret_q", "msci_ret_q_lag1"]).copy()
+    cal["AgeBucket"] = pd.cut(cal["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+    cal = cal[["FundID", "Adj Strategy", "Grade", "AgeBucket", "omega", "msci_ret_q", "msci_ret_q_lag1"]].copy()
+    if cal.empty:
+        raise ValueError("NAV Logic inline: no calibration rows after filtering.")
+
+    from scipy import stats
+
+    def ols_cluster_robust(df_in, y_col, x_cols, cluster_col):
+        d = df_in.dropna(subset=[y_col] + x_cols + [cluster_col]).copy()
+        n = len(d)
+        if n == 0:
+            return None
+
+        y = d[y_col].to_numpy(float)
+        X = np.column_stack([np.ones(n)] + [d[c].to_numpy(float) for c in x_cols])
+        k = X.shape[1]
+
+        XtX = X.T @ X
+        XtX_inv = np.linalg.pinv(XtX)
+        beta = XtX_inv @ (X.T @ y)
+
+        u = y - X @ beta
+        clusters = d[cluster_col].to_numpy()
+        uniq = pd.unique(clusters)
+        G = len(uniq)
+        df_dof = G - 1
+        if G <= 1:
+            return None
+
+        meat = np.zeros((k, k), dtype=float)
+        for g in uniq:
+            mask = (clusters == g)
+            Xg = X[mask, :]
+            ug = u[mask]
+            Xgu = Xg.T @ ug
+            meat += np.outer(Xgu, Xgu)
+
+        V = XtX_inv @ meat @ XtX_inv
+        scale = (G / (G - 1)) * ((n - 1) / max(n - k, 1))
+        V *= scale
+
+        se = np.sqrt(np.diag(V))
+        tstats = beta / se
+        pvals = 2.0 * (1.0 - stats.t.cdf(np.abs(tstats), df=df_dof))
+
+        names = ["alpha"] + x_cols
+        return {
+            "coef": pd.Series(beta, index=names),
+            "se": pd.Series(se, index=names),
+            "t": pd.Series(tstats, index=names),
+            "p": pd.Series(pvals, index=names),
+            "n_obs": int(n),
+            "n_clusters": int(G),
+            "df_dof": int(df_dof),
+        }
+
+    def cluster_mean_stats(df_in, y_col, cluster_col):
+        res = ols_cluster_robust(df_in, y_col=y_col, x_cols=[], cluster_col=cluster_col)
+        if res is None:
+            return None
+        return {
+            "alpha": float(res["coef"]["alpha"]),
+            "se_alpha": float(res["se"]["alpha"]),
+            "t_alpha": float(res["t"]["alpha"]),
+            "p_alpha": float(res["p"]["alpha"]),
+            "n_obs": res["n_obs"],
+            "n_funds": res["n_clusters"],
+            "df": res["df_dof"],
+        }
+
+    # Betas
+    beta_rows_sg = []
+    for (s, g), grp in cal.groupby(["Adj Strategy", "Grade"], dropna=False):
+        res = ols_cluster_robust(grp, "omega", ["msci_ret_q", "msci_ret_q_lag1"], "FundID")
+        if res is None:
+            continue
+        n_funds = res["n_clusters"]
+        usable = (n_funds >= min_clusters_for_inference)
+
+        b0 = float(res["coef"]["msci_ret_q"])
+        b1 = float(res["coef"]["msci_ret_q_lag1"])
+        p0 = float(res["p"]["msci_ret_q"])
+        p1 = float(res["p"]["msci_ret_q_lag1"])
+        use_beta = bool(usable and ((p0 < alpha_level) or (p1 < alpha_level)))
+
+        beta_rows_sg.append({
+            "Adj Strategy": s, "Grade": g,
+            "b0": b0, "b1": b1,
+            "p_b0": p0, "p_b1": p1,
+            "n_obs": res["n_obs"], "n_funds": n_funds,
+            "use_beta": use_beta
+        })
+    beta_sg = pd.DataFrame(beta_rows_sg)
+
+    beta_rows_s = []
+    for s, grp in cal.groupby(["Adj Strategy"], dropna=False):
+        res = ols_cluster_robust(grp, "omega", ["msci_ret_q", "msci_ret_q_lag1"], "FundID")
+        if res is None:
+            continue
+        n_funds = res["n_clusters"]
+        usable = (n_funds >= min_clusters_for_inference)
+
+        b0 = float(res["coef"]["msci_ret_q"])
+        b1 = float(res["coef"]["msci_ret_q_lag1"])
+        p0 = float(res["p"]["msci_ret_q"])
+        p1 = float(res["p"]["msci_ret_q_lag1"])
+        use_beta = bool(usable and ((p0 < alpha_level) or (p1 < alpha_level)))
+
+        beta_rows_s.append({
+            "Adj Strategy": s, "b0": b0, "b1": b1,
+            "p_b0": p0, "p_b1": p1,
+            "n_obs": res["n_obs"], "n_funds": n_funds,
+            "use_beta": use_beta
+        })
+    beta_s = pd.DataFrame(beta_rows_s)
+
+    res_g = ols_cluster_robust(cal, "omega", ["msci_ret_q", "msci_ret_q_lag1"], "FundID")
+    if res_g is None:
+        raise ValueError("NAV Logic inline: global beta regression failed.")
+    b0_g = float(res_g["coef"]["msci_ret_q"])
+    b1_g = float(res_g["coef"]["msci_ret_q_lag1"])
+
+    beta_sg_use = beta_sg.loc[beta_sg["use_beta"]].set_index(["Adj Strategy", "Grade"])[["b0", "b1"]].to_dict("index")
+    beta_s_use = beta_s.loc[beta_s["use_beta"]].set_index(["Adj Strategy"])[["b0", "b1"]].to_dict("index")
+
+    def get_betas(strategy, grade):
+        k = (strategy, grade)
+        if k in beta_sg_use:
+            d = beta_sg_use[k]
+            return float(d["b0"]), float(d["b1"]), "sg_sig"
+        if strategy in beta_s_use:
+            d = beta_s_use[strategy]
+            return float(d["b0"]), float(d["b1"]), "s_sig"
+        return float(b0_g), float(b1_g), "global"
+
+    # Alpha
+    cal2 = cal.copy()
+    b0_used = []
+    b1_used = []
+    for _, r in cal2.iterrows():
+        b0, b1, _ = get_betas(r["Adj Strategy"], r["Grade"])
+        b0_used.append(b0); b1_used.append(b1)
+    cal2["b0_used"] = b0_used
+    cal2["b1_used"] = b1_used
+    cal2["omega_adj"] = cal2["omega"] - cal2["b0_used"]*cal2["msci_ret_q"] - cal2["b1_used"]*cal2["msci_ret_q_lag1"]
+
+    alpha_rows_sga = []
+    for (s, g, a), grp in cal2.groupby(["Adj Strategy","Grade","AgeBucket"], dropna=False):
+        st = cluster_mean_stats(grp, "omega_adj", "FundID")
+        if st is None:
+            continue
+        use_alpha = bool((st["n_funds"] >= min_clusters_for_inference) and (st["p_alpha"] < alpha_level))
+        alpha_rows_sga.append({"Adj Strategy": s, "Grade": g, "AgeBucket": a, **st, "use_alpha": use_alpha})
+    alpha_sga = pd.DataFrame(alpha_rows_sga)
+
+    alpha_rows_sg = []
+    for (s, g), grp in cal2.groupby(["Adj Strategy","Grade"], dropna=False):
+        st = cluster_mean_stats(grp, "omega_adj", "FundID")
+        if st is None:
+            continue
+        use_alpha = bool((st["n_funds"] >= min_clusters_for_inference) and (st["p_alpha"] < alpha_level))
+        alpha_rows_sg.append({"Adj Strategy": s, "Grade": g, **st, "use_alpha": use_alpha})
+    alpha_sg = pd.DataFrame(alpha_rows_sg)
+
+    alpha_rows_s = []
+    for s, grp in cal2.groupby(["Adj Strategy"], dropna=False):
+        st = cluster_mean_stats(grp, "omega_adj", "FundID")
+        if st is None:
+            continue
+        use_alpha = bool((st["n_funds"] >= min_clusters_for_inference) and (st["p_alpha"] < alpha_level))
+        alpha_rows_s.append({"Adj Strategy": s, **st, "use_alpha": use_alpha})
+    alpha_s = pd.DataFrame(alpha_rows_s)
+
+    st_g = cluster_mean_stats(cal2, "omega_adj", "FundID")
+    alpha_global = float(st_g["alpha"]) if st_g else 0.0
+
+    alpha_sga_use = alpha_sga.loc[alpha_sga["use_alpha"]].set_index(["Adj Strategy","Grade","AgeBucket"])["alpha"].to_dict()
+    alpha_sg_use  = alpha_sg.loc[alpha_sg["use_alpha"]].set_index(["Adj Strategy","Grade"])["alpha"].to_dict()
+    alpha_s_use   = alpha_s.loc[alpha_s["use_alpha"]].set_index(["Adj Strategy"])["alpha"].to_dict()
+
+    def get_alpha(strategy, grade, age_bucket):
+        k = (strategy, grade, age_bucket)
+        if k in alpha_sga_use:
+            return float(alpha_sga_use[k]), "sga_sig"
+        k2 = (strategy, grade)
+        if k2 in alpha_sg_use:
+            return float(alpha_sg_use[k2]), "sg_sig"
+        if strategy in alpha_s_use:
+            return float(alpha_s_use[strategy]), "s_sig"
+        return float(alpha_global), "global"
+
+    # Sigma
+    resid = []
+    for _, r in cal.iterrows():
+        b0, b1, _ = get_betas(r["Adj Strategy"], r["Grade"])
+        a, _ = get_alpha(r["Adj Strategy"], r["Grade"], r["AgeBucket"])
+        pred = a + b0*r["msci_ret_q"] + b1*r["msci_ret_q_lag1"]
+        resid.append(float(r["omega"] - pred))
+
+    cal_res = cal.copy()
+    cal_res["resid"] = resid
+
+    sigma_sg = (
+        cal_res.groupby(["Adj Strategy","Grade"], dropna=False)
+               .agg(n_obs=("resid","size"),
+                    sigma=("resid", lambda x: float(np.std(x, ddof=1)) if len(x) > 2 else 0.10))
+               .reset_index()
+    )
+    sigma_global = float(np.std(cal_res["resid"], ddof=1))
+    sigma_global = max(sigma_global, 0.02)
+
+    sigma_sg_map = sigma_sg.set_index(["Adj Strategy","Grade"])[["sigma","n_obs"]].to_dict("index")
+
+    def get_sigma(strategy, grade):
+        k = (strategy, grade)
+        if k in sigma_sg_map:
+            s = float(sigma_sg_map[k]["sigma"])
+            n = float(sigma_sg_map[k]["n_obs"])
+            w = n / (n + SIGMA_SHRINK_K)
+            return float(w*s + (1.0-w)*sigma_global), "sg_shrunk"
+        return float(sigma_global), "global"
+
+    # NAV_start imputation
+    hist_upto = df.loc[df["quarter_end"] <= start_qe].copy()
+    if hist_upto.empty:
+        raise ValueError("NAV Logic inline: no data at or before start quarter.")
+
+    hist_upto = hist_upto.sort_values(["FundID","quarter_end"])
+    base_rows = hist_upto.groupby("FundID").tail(1).copy()
+
+    base_rows["ever_overran"] = base_rows["FundID"].map(ever_overran_map).fillna(False)
+
+    caps = []
+    for _, r in base_rows.iterrows():
+        planned = r["planned_end_qe"]
+        if pd.isna(planned):
+            caps.append(future_qe_max)
+            continue
+        if bool(r["ever_overran"]):
+            avg_over = float(avg_overrun_by_strategy.get(r["Adj Strategy"], 0.0))
+            caps.append(add_quarters(planned, avg_over))
+        else:
+            caps.append(planned)
+    base_rows["cap_qe"] = caps
+    base_rows["AgeBucket"] = pd.cut(base_rows["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+
+    hist_upto["draw_cum"] = hist_upto.groupby("FundID")[DRAW_COL].cumsum()
+    if "draw_cum" not in base_rows.columns:
+        base_rows = base_rows.merge(
+            hist_upto.groupby("FundID")["draw_cum"].last().reset_index(),
+            on="FundID",
+            how="left"
+        )
+
+    tmp = hist_upto.copy()
+    tmp["AgeBucket"] = pd.cut(tmp["Fund_Age_Quarters"], bins=AGE_BINS_Q, labels=AGE_LABELS)
+
+    tmp["ratio_nav_draw"] = np.where(
+        (tmp[NAV_COL].notna()) & (tmp[NAV_COL].abs() > NAV_EPS) & (tmp["draw_cum"] > DRAW_EPS),
+        tmp[NAV_COL] / tmp["draw_cum"],
+        np.nan
+    )
+    tmp["ratio_nav_size"] = np.where(
+        (tmp[NAV_COL].notna()) & (tmp[NAV_COL].abs() > NAV_EPS) & (tmp[SIZE_COL] > SIZE_EPS),
+        tmp[NAV_COL] / tmp[SIZE_COL],
+        np.nan
+    )
+
+    tmp["log_ratio_nav_draw"] = np.log(tmp["ratio_nav_draw"])
+    tmp["log_ratio_nav_size"] = np.log(tmp["ratio_nav_size"])
+    tmp.loc[~np.isfinite(tmp["log_ratio_nav_draw"]), "log_ratio_nav_draw"] = np.nan
+    tmp.loc[~np.isfinite(tmp["log_ratio_nav_size"]), "log_ratio_nav_size"] = np.nan
+
+    ratio_key = ["Adj Strategy","Grade","AgeBucket"]
+
+    def fit_lognorm(df_in: pd.DataFrame, col: str) -> pd.Series:
+        g = df_in[col].dropna()
+        if len(g) < MIN_OBS_RATIO:
+            return pd.Series({"mu": np.nan, "sig": np.nan, "n": len(g)})
+        return pd.Series({"mu": float(g.mean()), "sig": float(g.std(ddof=1)), "n": len(g)})
+
+    ratio_draw = tmp.groupby(ratio_key, dropna=False).apply(lambda g: fit_lognorm(g, "log_ratio_nav_draw")).reset_index()
+    ratio_size = tmp.groupby(ratio_key, dropna=False).apply(lambda g: fit_lognorm(g, "log_ratio_nav_size")).reset_index()
+
+    gdraw = ratio_draw.dropna(subset=["mu","sig"])
+    gsize = ratio_size.dropna(subset=["mu","sig"])
+    fallback_draw = {"mu": float(gdraw["mu"].median()) if len(gdraw) else 0.0,
+                     "sig": float(gdraw["sig"].median()) if len(gdraw) else 0.75}
+    fallback_size = {"mu": float(gsize["mu"].median()) if len(gsize) else -2.0,
+                     "sig": float(gsize["sig"].median()) if len(gsize) else 0.75}
+
+    ratio_draw_map = ratio_draw.set_index(ratio_key)[["mu","sig","n"]].to_dict("index")
+    ratio_size_map = ratio_size.set_index(ratio_key)[["mu","sig","n"]].to_dict("index")
+
+    def lookup_ratio(map_, strategy, grade, age_bucket, fallback):
+        k = (strategy, grade, age_bucket)
+        if k in map_:
+            d = map_[k]
+            if pd.notna(d["mu"]) and pd.notna(d["sig"]) and d["n"] >= MIN_OBS_RATIO:
+                return float(d["mu"]), float(d["sig"]), "bucket"
+        return float(fallback["mu"]), float(fallback["sig"]), "global"
+
+    rng_init = np.random.default_rng(2025)
+    base_rows["NAV_start"] = base_rows[NAV_COL]
+    base_rows["NAV_start_source"] = "observed"
+
+    for idx, r in base_rows.iterrows():
+        nav_obs = r["NAV_start"]
+        if pd.notna(nav_obs) and abs(nav_obs) > NAV_EPS:
+            continue
+
+        draw_cum = r.get("draw_cum", 0.0)
+        size = r.get(SIZE_COL, 0.0)
+        draw_cum = 0.0 if pd.isna(draw_cum) else float(draw_cum)
+        size = 0.0 if pd.isna(size) else float(size)
+
+        strategy = r["Adj Strategy"]
+        grade = r.get("AssignedGrade", r["Grade"])
+        if pd.isna(grade):
+            grade = r["Grade"]
+        age_bucket = r["AgeBucket"]
+
+        if draw_cum > DRAW_EPS:
+            mu, sig, src = lookup_ratio(ratio_draw_map, strategy, grade, age_bucket, fallback_draw)
+            ratio = float(np.exp(mu + sig * rng_init.standard_normal()))
+            ratio = float(np.clip(ratio, 0.05, 5.0))
+            base_rows.at[idx, "NAV_start"] = ratio * draw_cum
+            base_rows.at[idx, "NAV_start_source"] = f"imputed_draw_{src}"
+        else:
+            base_rows.at[idx, "NAV_start"] = 0.0
+            base_rows.at[idx, "NAV_start_source"] = "imputed_zero_nodraw"
+
+    base_rows["NAV_start"] = pd.to_numeric(base_rows["NAV_start"], errors="coerce").fillna(0.0)
+
+    # Grade transitions (yearly)
+    GRADE_STATES = ["A","B","C","D"]
+    p1_all_path = os.path.join(data_dir, "grade_transition_1y_all.csv")
+    p1_pe_path  = os.path.join(data_dir, "grade_transition_1y_pe.csv")
+    p1_vc_path  = os.path.join(data_dir, "grade_transition_1y_vc.csv")
+    P1_ALL = pd.read_csv(p1_all_path, index_col=0) if os.path.exists(p1_all_path) else None
+    P1_PE  = pd.read_csv(p1_pe_path, index_col=0) if os.path.exists(p1_pe_path) else None
+    P1_VC  = pd.read_csv(p1_vc_path, index_col=0) if os.path.exists(p1_vc_path) else None
+
+    def _row_norm_df(P):
+        P = P.reindex(index=GRADE_STATES, columns=GRADE_STATES).fillna(0.0).clip(lower=0.0)
+        rs = P.sum(axis=1).replace(0.0, 1.0)
+        return P.div(rs, axis=0)
+
+    if P1_ALL is not None: P1_ALL = _row_norm_df(P1_ALL)
+    if P1_PE  is not None: P1_PE  = _row_norm_df(P1_PE)
+    if P1_VC  is not None: P1_VC  = _row_norm_df(P1_VC)
+
+    def build_yearly_transition_from_data(df_in, strategy=None):
+        d = df_in[["FundID","quarter_end","Grade","Adj Strategy"]].copy()
+        if strategy is not None:
+            d = d[d["Adj Strategy"] == strategy]
+        d = d.dropna(subset=["FundID","quarter_end","Grade"])
+        d["Grade"] = d["Grade"].astype(str).str.strip()
+        d = d[d["Grade"].isin(GRADE_STATES)]
+        d = d.sort_values(["FundID","quarter_end"])
+
+        transitions = []
+        for _, g in d.groupby("FundID", sort=False):
+            grades = g["Grade"].tolist()
+            if len(grades) < 5:
+                continue
+            yearly = grades[::4]
+            if len(yearly) < 2:
+                continue
+            transitions.extend(zip(yearly[:-1], yearly[1:]))
+
+        if not transitions:
+            counts = pd.DataFrame(0.0, index=GRADE_STATES, columns=GRADE_STATES)
+            probs = pd.DataFrame(np.eye(4), index=GRADE_STATES, columns=GRADE_STATES)
+            return counts, probs, 0
+
+        counts = pd.crosstab(
+            [a for a, _ in transitions],
+            [b for _, b in transitions]
+        ).reindex(index=GRADE_STATES, columns=GRADE_STATES, fill_value=0).astype(float)
+
+        probs = counts.div(counts.sum(axis=1).replace(0.0, 1.0), axis=0)
+        return counts, probs, len(transitions)
+
+    all_counts, all_probs, all_n = build_yearly_transition_from_data(df, strategy=None)
+    pe_counts, pe_probs, pe_n = build_yearly_transition_from_data(df, strategy="Private Equity")
+    vc_counts, vc_probs, vc_n = build_yearly_transition_from_data(df, strategy="Venture Capital")
+
+    def get_transition_matrix(strategy):
+        if strategy == "Private Equity" and P1_PE is not None:
+            return P1_PE, "PE_1Y"
+        if strategy == "Venture Capital" and P1_VC is not None:
+            return P1_VC, "VC_1Y"
+        if P1_ALL is not None:
+            return P1_ALL, "ALL_1Y"
+        if strategy == "Private Equity" and pe_n > 0:
+            return pe_probs, "PE_DATA"
+        if strategy == "Venture Capital" and vc_n > 0:
+            return vc_probs, "VC_DATA"
+        if all_n > 0:
+            return all_probs, "ALL_DATA"
+        return pd.DataFrame(np.eye(4), index=GRADE_STATES, columns=GRADE_STATES), "IDENTITY"
+
+    def sample_next_grade(curr_grade, P_df, rng):
+        if curr_grade not in GRADE_STATES:
+            curr_grade = "D"
+        row = P_df.loc[curr_grade].values.astype(float)
+        return str(rng.choice(GRADE_STATES, p=row))
+
+    # Projection loop (omega only)
+    omega_rows = []
+    sim_ids = [1]
+    for sim_id in sim_ids:
+        rng = np.random.default_rng(seed + int(sim_id))
+        msci_future_use = msci_future_map[sim_id]
+        for _, r in base_rows.iterrows():
+            fund_id = r["FundID"]
+            age0 = int(r["Fund_Age_Quarters"]) if pd.notna(r["Fund_Age_Quarters"]) else 0
+            strategy = r["Adj Strategy"]
+            grade = r["Grade"] if pd.notna(r["Grade"]) else "D"
+            cap_qe = r["cap_qe"]
+            if pd.isna(cap_qe):
+                cap_qe = msci_future_use["quarter_end"].iloc[-1]
+
+            for step, (qe, msci_r, msci_r_lag1) in enumerate(
+                zip(msci_future_use["quarter_end"], msci_future_use["msci_ret_q"], msci_future_use["msci_ret_q_lag1"]),
+                start=1
+            ):
+                if qe > cap_qe:
+                    break
+
+                msci_r_lag1 = 0.0 if pd.isna(msci_r_lag1) else float(msci_r_lag1)
+                age = age0 + step
+                age_bucket = pd.cut(pd.Series([age]), bins=AGE_BINS_Q, labels=AGE_LABELS).iloc[0]
+
+                prev_grade = grade
+                if step % 4 == 0:
+                    P, _ = get_transition_matrix(strategy)
+                    grade = sample_next_grade(grade, P, rng)
+
+                b0, b1, _ = get_betas(strategy, grade)
+                alpha, _ = get_alpha(strategy, grade, age_bucket)
+                sigma, _ = get_sigma(strategy, grade)
+
+                eps = rng.standard_normal()
+                omega = alpha + b0*float(msci_r) + b1*msci_r_lag1 + sigma*eps
+                omega += float(GRADE_OMEGA_BIAS.get(grade, 0.0))
+                if not np.isfinite(omega):
+                    omega = 0.0
+                omega = float(np.clip(omega, -OMEGA_CLIP, OMEGA_CLIP))
+
+                omega_rows.append({
+                    "sim_id": int(sim_id),
+                    "FundID": fund_id,
+                    "quarter_end": qe,
+                    "step_q": step,
+                    "msci_ret_q": float(msci_r),
+                    "msci_ret_q_lag1": float(msci_r_lag1),
+                    "omega": float(omega),
+                    "Fund_Age_Quarters": int(age),
+                    "Adj Strategy": strategy,
+                    "Grade_prev": prev_grade,
+                    "Grade": grade,
+                    "AgeBucket": age_bucket,
+                    "cap_qe": cap_qe,
+                })
+
+    omega_proj = pd.DataFrame(omega_rows)
+    navstart = base_rows[[
+        "FundID","Adj Strategy","Grade","Fund_Age_Quarters","NAV_start","NAV_start_source","cap_qe"
+    ]].copy()
+
+    return omega_proj, navstart
+
+# -----------------------------
 # NAV Logic inputs (optional)
 # -----------------------------
 
-def find_omega_file(data_dir: str) -> str:
+def find_omega_file(data_dir: str, start_qe: Optional[pd.Timestamp] = None,
+                    end_qe: Optional[pd.Timestamp] = None) -> str:
     cands = glob.glob(os.path.join(data_dir, "omega_projection_sota_*.parquet")) + \
             glob.glob(os.path.join(data_dir, "omega_projection_sota_*.csv"))
     if not cands:
         raise FileNotFoundError("No omega_projection_sota_* file found. Run NAV Logic first.")
-    cands.sort(key=os.path.getmtime, reverse=True)
-    return cands[0]
+
+    if start_qe is None or end_qe is None:
+        cands.sort(key=os.path.getmtime, reverse=True)
+        return cands[0]
+
+    best_path = None
+    best_overlap = -1
+    best_mtime = -1
+    ranges = []
+
+    for p in cands:
+        try:
+            if p.lower().endswith(".parquet"):
+                df = pd.read_parquet(p, columns=["quarter_end"])
+            else:
+                df = pd.read_csv(p, usecols=["quarter_end"])
+            q = pd.to_datetime(df["quarter_end"], errors="coerce").dt.to_period("Q").dt.to_timestamp("Q")
+            q = q.dropna()
+            if q.empty:
+                continue
+            qmin = q.min()
+            qmax = q.max()
+            ranges.append((p, qmin, qmax))
+
+            ov_start = max(start_qe, qmin)
+            ov_end = min(end_qe, qmax)
+            if ov_end < ov_start:
+                overlap = -1
+            else:
+                overlap = len(pd.period_range(ov_start, ov_end, freq="Q"))
+
+            mtime = os.path.getmtime(p)
+            if overlap > best_overlap or (overlap == best_overlap and mtime > best_mtime):
+                best_overlap = overlap
+                best_mtime = mtime
+                best_path = p
+        except Exception:
+            continue
+
+    if best_path is None or best_overlap <= 0:
+        msg = "No omega_projection_sota_* file overlaps the test window."
+        if ranges:
+            msg += " Available ranges:\n" + "\n".join([f"- {os.path.basename(p)}: {a.date()} to {b.date()}" for p, a, b in ranges])
+        raise ValueError(msg)
+
+    return best_path
 
 
 def find_navstart_file(data_dir: str, year: int, quarter: str) -> str:
@@ -929,13 +1561,51 @@ def main():
     draw_cum_hist = {}
 
     if USE_NAV_PROJECTIONS:
-        omega_path = find_omega_file(DATA_DIR)
-        navstart_path = find_navstart_file(DATA_DIR, year, quarter)
-        print("Using omega file:", omega_path)
-        print("Using nav_start file:", navstart_path)
+        if RUN_NAV_LOGIC_INLINE:
+            # Load MSCI (quarterly) for inline NAV Logic
+            msci_path = os.path.join(DATA_DIR, "msci.xlsx")
+            if not os.path.exists(msci_path):
+                msci_path = os.path.join(DATA_DIR, "MSCI.xlsx")
+            if not os.path.exists(msci_path):
+                raise FileNotFoundError("Missing msci.xlsx / MSCI.xlsx in DATA_DIR")
+            msci_q = load_msci_quarterly(msci_path)
+            msci_q = msci_q.sort_values("quarter_end").reset_index(drop=True)
+            msci_q["msci_ret_q_lag1"] = msci_q["msci_ret_q"].shift(1)
 
-        omega_df = pd.read_parquet(omega_path) if omega_path.lower().endswith(".parquet") else pd.read_csv(omega_path)
-        navstart = pd.read_parquet(navstart_path) if navstart_path.lower().endswith(".parquet") else pd.read_csv(navstart_path)
+            # Build MSCI history + future for NAV Logic (conditional backtest)
+            start_qe = train_end_qe
+            msci_hist_inline = msci_q[msci_q["quarter_end"] <= start_qe].copy()
+            last_hist_ret = msci_hist_inline["msci_ret_q"].tail(1)
+            last_hist_ret_val = float(last_hist_ret.iloc[0]) if len(last_hist_ret) else 0.0
+
+            msci_future = msci_q[(msci_q["quarter_end"] > start_qe) &
+                                 (msci_q["quarter_end"] <= test_end_qe)].copy()
+            if len(msci_future) != len(test_quarters):
+                raise ValueError("MSCI history does not fully cover the backtest window.")
+            msci_future = msci_future.sort_values("quarter_end").reset_index(drop=True)
+            msci_future["msci_ret_q_lag1"] = msci_future["msci_ret_q"].shift(1)
+            if len(msci_future):
+                msci_future.loc[0, "msci_ret_q_lag1"] = last_hist_ret_val
+            msci_future["msci_ret_q_lag1"] = msci_future["msci_ret_q_lag1"].fillna(0.0)
+
+            omega_df, navstart = run_nav_logic_inline(
+                data=data,
+                msci_hist=msci_hist_inline,
+                msci_future=msci_future,
+                start_qe=start_qe,
+                data_dir=DATA_DIR,
+                alpha_level=NAV_LOGIC_ALPHA_LEVEL,
+                min_clusters_for_inference=NAV_LOGIC_MIN_CLUSTERS,
+                seed=seed,
+            )
+        else:
+            omega_path = find_omega_file(DATA_DIR, test_start_qe, test_end_qe)
+            navstart_path = find_navstart_file(DATA_DIR, train_year, train_quarter)
+            print("Using omega file:", omega_path)
+            print("Using nav_start file:", navstart_path)
+
+            omega_df = pd.read_parquet(omega_path) if omega_path.lower().endswith(".parquet") else pd.read_csv(omega_path)
+            navstart = pd.read_parquet(navstart_path) if navstart_path.lower().endswith(".parquet") else pd.read_csv(navstart_path)
 
         need_omega = {"FundID", "quarter_end", "omega"}
         if not need_omega.issubset(omega_df.columns):
@@ -958,29 +1628,18 @@ def main():
             omega_df["sim_id"] = 1
         omega_df["sim_id"] = pd.to_numeric(omega_df["sim_id"], errors="coerce").fillna(1).astype(int)
 
-        # align test window to omega coverage if needed
+        # require omega to fully cover the test window
         omega_min = omega_df["quarter_end"].min()
         omega_max = omega_df["quarter_end"].max()
-        adj_start = max(test_start_qe, omega_min)
-        adj_end = min(test_end_qe, omega_max)
-        if adj_end < adj_start:
+        if omega_min > test_start_qe or omega_max < test_end_qe:
             raise ValueError(
-                f"omega_projection has no overlap with test window. "
+                "omega_projection does not fully cover the test window. "
                 f"omega range: {omega_min.date()} to {omega_max.date()}, "
-                f"test window: {test_start_qe.date()} to {test_end_qe.date()}."
+                f"test window: {test_start_qe.date()} to {test_end_qe.date()}. "
+                "Run NAV Logic for the backtest window and re-run."
             )
-        if adj_start != test_start_qe or adj_end != test_end_qe:
-            print(
-                "Adjusting test window to omega coverage:",
-                f"{test_start_qe.date()}–{test_end_qe.date()} -> {adj_start.date()}–{adj_end.date()}",
-            )
-            test_start_qe = adj_start
-            test_end_qe = adj_end
-            test_quarters = quarter_range(test_start_qe, test_end_qe)
-            if not test_quarters:
-                raise ValueError("Adjusted test window has no quarters.")
 
-        # restrict to (possibly adjusted) test window
+        # restrict to test window
         omega_df = omega_df[(omega_df["quarter_end"] >= test_start_qe) &
                             (omega_df["quarter_end"] <= test_end_qe)].copy()
 
@@ -1030,16 +1689,22 @@ def main():
                          .groupby("FundID")["Adj Drawdown EUR"].sum()
                          .to_dict())
 
-    # MSCI data
-    msci_path = os.path.join(DATA_DIR, "msci.xlsx")
-    if not os.path.exists(msci_path):
-        msci_path = os.path.join(DATA_DIR, "MSCI.xlsx")
-    if not os.path.exists(msci_path):
-        raise FileNotFoundError("Missing msci.xlsx / MSCI.xlsx in DATA_DIR")
+    if USE_NAV_PROJECTIONS and not draw_cum_hist:
+        draw_cum_hist = (data[data["quarter_end"] <= test_start_qe]
+                         .groupby("FundID")["Adj Drawdown EUR"].sum()
+                         .to_dict())
 
-    msci_q = load_msci_quarterly(msci_path)
-    msci_q = msci_q.sort_values("quarter_end").reset_index(drop=True)
-    msci_q["msci_ret_q_lag1"] = msci_q["msci_ret_q"].shift(1)
+    # MSCI data (load if not already loaded for inline NAV Logic)
+    if "msci_q" not in locals():
+        msci_path = os.path.join(DATA_DIR, "msci.xlsx")
+        if not os.path.exists(msci_path):
+            msci_path = os.path.join(DATA_DIR, "MSCI.xlsx")
+        if not os.path.exists(msci_path):
+            raise FileNotFoundError("Missing msci.xlsx / MSCI.xlsx in DATA_DIR")
+
+        msci_q = load_msci_quarterly(msci_path)
+        msci_q = msci_q.sort_values("quarter_end").reset_index(drop=True)
+        msci_q["msci_ret_q_lag1"] = msci_q["msci_ret_q"].shift(1)
 
     # Train/test splits (initial)
     train = data[data["quarter_end"] <= train_end_qe].copy()
@@ -1069,8 +1734,11 @@ def main():
         if not test_funds:
             raise ValueError("No overlap between test funds and NAV Logic projection inputs.")
         if sim_ids:
-            n_sims = len(sim_ids)
-            print(f"Using {n_sims} NAV Logic sim_id(s) from omega projections.")
+            if len(sim_ids) > 1:
+                n_sims = len(sim_ids)
+                print(f"Using {n_sims} NAV Logic sim_id(s) from omega projections.")
+            else:
+                print(f"Using single NAV Logic omega path; cashflow sims = {n_sims}.")
 
     # Planned end date (cap)
     data["planned_end_qe"] = pd.to_datetime(
@@ -1806,22 +2474,33 @@ def main():
         n_funds = len(fund_ids)
         fund_index = {fid: i for i, fid in enumerate(fund_ids)}
 
-        sim_id_list = sim_ids if USE_NAV_PROJECTIONS and sim_ids else list(range(n_sims))
+        omega_key = None
+        if USE_NAV_PROJECTIONS and sim_ids:
+            if len(sim_ids) == 1:
+                sim_id_list = list(range(n_sims))
+                omega_key = sim_ids[0]
+            else:
+                sim_id_list = sim_ids
+        else:
+            sim_id_list = list(range(n_sims))
 
         for s_idx, sim_id in enumerate(sim_id_list):
-            rng = np.random.default_rng(seed + (int(sim_id) if USE_NAV_PROJECTIONS else s_idx))
+            rng = np.random.default_rng(seed + s_idx)
+            omega_sim_id = omega_key if omega_key is not None else sim_id
 
-            # MSCI path (from NAV Logic if available)
-            if USE_NAV_PROJECTIONS and sim_id in msci_map_sim:
-                msci_series = pd.Series([float(msci_map_sim[sim_id].get(qe, 0.0)) for qe in test_quarters],
+            # MSCI path: conditional uses actual MSCI; unconditional may use NAV Logic or simulated
+            if conditional:
+                msci_series = pd.Series([msci_map[qe] for qe in test_quarters],
                                         index=pd.Index(test_quarters, name="quarter_end"))
-                stats = msci_stats_by_sim.get(sim_id, {})
-                msci_mu = float(stats.get("mean", msci_mu_all))
-                msci_sigma = float(stats.get("std", msci_sigma_all))
+                msci_mu = msci_mu_all
+                msci_sigma = msci_sigma_all
             else:
-                if conditional:
-                    msci_path = pd.DataFrame({"quarter_end": test_quarters,
-                                              "msci_ret_q": [msci_map[qe] for qe in test_quarters]})
+                if USE_NAV_PROJECTIONS and omega_sim_id in msci_map_sim:
+                    msci_series = pd.Series([float(msci_map_sim[omega_sim_id].get(qe, 0.0)) for qe in test_quarters],
+                                            index=pd.Index(test_quarters, name="quarter_end"))
+                    stats = msci_stats_by_sim.get(omega_sim_id, {})
+                    msci_mu = float(stats.get("mean", msci_mu_all))
+                    msci_sigma = float(stats.get("std", msci_sigma_all))
                 else:
                     msci_path = simulate_msci_path(msci_q[msci_q["quarter_end"] <= train_end_qe],
                                                    start_qe=train_end_qe,
@@ -1829,10 +2508,10 @@ def main():
                                                    scenario=scenario,
                                                    tilt_strength=tilt_strength,
                                                    rng=rng)
-                msci_path = msci_path.set_index("quarter_end")
-                msci_series = msci_path["msci_ret_q"]
-                msci_mu = msci_mu_all
-                msci_sigma = msci_sigma_all
+                    msci_path = msci_path.set_index("quarter_end")
+                    msci_series = msci_path["msci_ret_q"]
+                    msci_mu = msci_mu_all
+                    msci_sigma = msci_sigma_all
 
             if not np.isfinite(msci_sigma) or msci_sigma <= 0:
                 msci_sigma = 1e-6
@@ -1887,8 +2566,8 @@ def main():
                         continue
 
                     age_q = int(st["age0"] + t_idx)
-                    if USE_NAV_PROJECTIONS and sim_id in age_map:
-                        age_q = age_map[sim_id].get((fid, qe), age_q)
+                    if USE_NAV_PROJECTIONS and omega_sim_id in age_map:
+                        age_q = age_map[omega_sim_id].get((fid, qe), age_q)
                         age_q = int(round(float(age_q)))
                     age_bucket = make_age_bucket_q(age_q)
 
@@ -1899,18 +2578,18 @@ def main():
                             st["grade"] = sample_next_grade(st["grade"], P, rng)
 
                     grade = st["grade"]
-                    if USE_NAV_PROJECTIONS and sim_id in grade_map:
-                        grade = grade_map[sim_id].get((fid, qe), grade)
+                    if USE_NAV_PROJECTIONS and omega_sim_id in grade_map:
+                        grade = grade_map[omega_sim_id].get((fid, qe), grade)
                         st["grade"] = grade
 
                     strategy = st["strategy"]
-                    if USE_NAV_PROJECTIONS and sim_id in strategy_map:
-                        strategy = strategy_map[sim_id].get((fid, qe), strategy)
+                    if USE_NAV_PROJECTIONS and omega_sim_id in strategy_map:
+                        strategy = strategy_map[omega_sim_id].get((fid, qe), strategy)
                         st["strategy"] = strategy
 
                     # omega
                     if USE_NAV_PROJECTIONS:
-                        omega = float(omega_map.get(sim_id, {}).get((fid, qe), 0.0))
+                        omega = float(omega_map.get(omega_sim_id, {}).get((fid, qe), 0.0))
                     else:
                         a, b0, b1 = get_betas(strategy, grade)
                         alpha, _ = get_alpha(strategy, grade, str(age_bucket))
@@ -1997,9 +2676,12 @@ def main():
                     runoff_mult = float(runoff_mult_by_strategy.get(strategy, 1.0)) if USE_RUNOFF_CALIBRATION else 1.0
 
                     cap_qe = st["cap_qe"]
-                    q_left = 9999
-                    if pd.notna(cap_qe):
-                        q_left = max(quarter_diff(cap_qe, qe), 0)
+                    if USE_NAV_PROJECTIONS:
+                        q_left = max(T - (t_idx + 1), 0)
+                    else:
+                        q_left = 9999
+                        if pd.notna(cap_qe):
+                            q_left = max(quarter_diff(cap_qe, qe), 0)
 
                     tail_factor = 0.0
                     if RUNOFF_Q > 0:
@@ -2160,12 +2842,17 @@ def main():
         bucket_summary = pd.DataFrame(bucket_rows)
         return portfolio_series, portfolio_summary, bucket_summary
 
-    # Run conditional and unconditional
-    print("Running conditional backtest (actual MSCI)...")
-    cond_series, cond_portfolio, cond_bucket = run_backtest("conditional", conditional=True)
+    # Run conditional / unconditional as configured
+    cond_series = cond_portfolio = cond_bucket = None
+    uncond_series = uncond_portfolio = uncond_bucket = None
 
-    print("Running unconditional backtest (simulated MSCI)...")
-    uncond_series, uncond_portfolio, uncond_bucket = run_backtest(scenario_uncond, conditional=False)
+    if RUN_CONDITIONAL:
+        print("Running conditional backtest (actual MSCI)...")
+        cond_series, cond_portfolio, cond_bucket = run_backtest("conditional", conditional=True)
+
+    if RUN_UNCONDITIONAL:
+        print("Running unconditional backtest (simulated MSCI)...")
+        uncond_series, uncond_portfolio, uncond_bucket = run_backtest(scenario_uncond, conditional=False)
 
     # Save
     def _yq(qe: pd.Timestamp) -> str:
@@ -2179,20 +2866,21 @@ def main():
     out_cond_bucket = os.path.join(DATA_DIR, f"backtest_bucket_summary_conditional_{train_year}_{train_quarter}_to_{test_end_tag}.csv")
     out_uncond_bucket = os.path.join(DATA_DIR, f"backtest_bucket_summary_unconditional_{train_year}_{train_quarter}_to_{test_end_tag}.csv")
 
-    cond_series.to_csv(out_cond_series, index=False)
-    uncond_series.to_csv(out_uncond_series, index=False)
-    cond_portfolio.to_csv(out_cond_port, index=False)
-    uncond_portfolio.to_csv(out_uncond_port, index=False)
-    cond_bucket.to_csv(out_cond_bucket, index=False)
-    uncond_bucket.to_csv(out_uncond_bucket, index=False)
-
     print("Saved:")
-    print(out_cond_series)
-    print(out_uncond_series)
-    print(out_cond_port)
-    print(out_uncond_port)
-    print(out_cond_bucket)
-    print(out_uncond_bucket)
+    if RUN_CONDITIONAL and cond_series is not None:
+        cond_series.to_csv(out_cond_series, index=False)
+        cond_portfolio.to_csv(out_cond_port, index=False)
+        cond_bucket.to_csv(out_cond_bucket, index=False)
+        print(out_cond_series)
+        print(out_cond_port)
+        print(out_cond_bucket)
+    if RUN_UNCONDITIONAL and uncond_series is not None:
+        uncond_series.to_csv(out_uncond_series, index=False)
+        uncond_portfolio.to_csv(out_uncond_port, index=False)
+        uncond_bucket.to_csv(out_uncond_bucket, index=False)
+        print(out_uncond_series)
+        print(out_uncond_port)
+        print(out_uncond_bucket)
 
     print("Runtime (seconds):", round(time.perf_counter() - t0, 2))
 
