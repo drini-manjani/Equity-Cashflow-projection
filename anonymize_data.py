@@ -8,7 +8,6 @@ Usage:
 
 import argparse
 import os
-import sys
 from typing import List
 
 import pandas as pd
@@ -63,17 +62,57 @@ def _write_any(df: pd.DataFrame, path: str) -> None:
     raise ValueError("Unsupported output type. Use .csv or .parquet")
 
 
+def _find_default_input() -> str:
+    # 1) current working directory
+    cwd_path = os.path.abspath("data.csv")
+    if os.path.exists(cwd_path):
+        return cwd_path
+
+    # 2) Windows-style Documents/Equity/*/data/data.csv (pick most recent)
+    home = os.environ.get("USERPROFILE") or os.environ.get("HOME") or ""
+    if home:
+        base = os.path.join(home, "Documents", "Equity")
+        if os.path.isdir(base):
+            candidates = []
+            for root, _, files in os.walk(base):
+                if "data.csv" in files and os.path.basename(root).lower() == "data":
+                    candidates.append(os.path.join(root, "data.csv"))
+            if candidates:
+                candidates.sort(key=os.path.getmtime, reverse=True)
+                return candidates[0]
+
+    return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", default="data.csv", help="Input data file (.csv or .parquet). Default: data.csv")
-    ap.add_argument("--output", default="data_anonymized.csv", help="Output anonymized file (.csv or .parquet)")
-    ap.add_argument("--map-out", default="fund_map.csv", help="Fund name mapping output (.csv or .parquet)")
+    ap.add_argument("--input", default="", help="Input data file (.csv or .parquet). Default: auto-detect")
+    ap.add_argument("--output", default="", help="Output anonymized file (.csv or .parquet). Default: alongside input")
+    ap.add_argument("--map-out", default="", help="Fund name mapping output (.csv or .parquet). Default: alongside input")
     # In notebooks/IDEs, extra args may be injected (e.g., -f). Ignore unknowns.
     args, unknown = ap.parse_known_args()
     if unknown:
         print("Warning: ignoring unknown arguments:", " ".join(unknown))
 
-    df = _read_any(args.input)
+    input_path = args.input or _find_default_input()
+    if not input_path:
+        raise FileNotFoundError(
+            "Could not auto-detect data.csv. Please pass --input with the full path."
+        )
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    if args.output:
+        output_path = args.output
+    else:
+        output_path = os.path.join(os.path.dirname(input_path), "data_anonymized.csv")
+
+    if args.map_out:
+        map_path = args.map_out
+    else:
+        map_path = os.path.join(os.path.dirname(input_path), "fund_map.csv")
+
+    df = _read_any(input_path)
     # normalize column names for matching
     col_map = {_norm_key(c): c for c in df.columns}
 
@@ -110,16 +149,17 @@ def main() -> int:
     name_map = {orig: f"Fund{idx+1}" for idx, orig in enumerate(seen)}
     out[fund_col] = out[fund_col].astype(str).map(name_map)
 
-    _write_any(out, args.output)
+    _write_any(out, output_path)
 
     map_df = pd.DataFrame({"VC Fund Name": list(name_map.keys()),
                            "Fund_Anon": list(name_map.values())})
-    _write_any(map_df, args.map_out)
+    _write_any(map_df, map_path)
 
     print(f"Anonymized rows: {len(out)}")
     print(f"Unique funds: {len(name_map)}")
-    print(f"Output: {args.output}")
-    print(f"Mapping file: {args.map_out}")
+    print(f"Input: {input_path}")
+    print(f"Output: {output_path}")
+    print(f"Mapping file: {map_path}")
     return 0
 
 
