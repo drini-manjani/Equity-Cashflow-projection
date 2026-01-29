@@ -2917,6 +2917,91 @@ def main():
         print("Running unconditional backtest (simulated MSCI)...")
         uncond_series, uncond_portfolio, uncond_bucket = run_backtest(scenario_uncond, conditional=False)
 
+    # =============================
+    # Omega + fund coverage checks
+    # =============================
+    print("=== Backtest validation ===")
+    try:
+        # Fund coverage in test window
+        test_funds_all = set(test["FundID"].unique().tolist())
+        used_funds = set(fund_states.keys())
+        print("Funds in test window:", len(test_funds_all))
+        print("Funds used in backtest:", len(used_funds))
+        if USE_NAV_PROJECTIONS:
+            nav_funds = set(nav_start_by_fund.keys())
+            omega_funds = set(omega_df["FundID"].unique()) if omega_df is not None else set()
+            print("Funds with nav_start:", len(nav_funds))
+            print("Funds with omega:", len(omega_funds))
+            print("Overlap (test & nav & omega):", len(used_funds))
+        # Funds that begin after train end (excluded from NAV projections)
+        fc = data.groupby("FundID")["first_close_qe"].min()
+        n_post_train = int((fc > train_end_qe).sum())
+        print("Funds with first_close after train end:", n_post_train)
+        if USE_NAV_PROJECTIONS and navstart is not None:
+            ns = navstart.set_index("FundID").reindex(list(used_funds))
+            nav_zero = int((ns["NAV_start"] <= NAV_EPS).sum())
+            nav_total = int(ns["NAV_start"].notna().sum())
+            print("NAV_start <= NAV_EPS among used funds:", nav_zero, "/", nav_total)
+    except Exception as e:
+        print("Fund coverage check failed:", repr(e))
+
+    try:
+        if omega_df is None:
+            print("Omega validation skipped (omega_df missing).")
+        else:
+            # Actual omega (test window)
+            df = data.sort_values(["FundID", "quarter_end"]).copy()
+            df["nav_prev"] = df.groupby("FundID")["NAV Adjusted EUR"].shift(1)
+            df["flow_net"] = df["Adj Drawdown EUR"] - df["Adj Repayment EUR"]
+            m = df["nav_prev"].abs() > NAV_EPS
+            df["omega_actual"] = np.nan
+            df.loc[m, "omega_actual"] = (
+                (df.loc[m, "NAV Adjusted EUR"] - df.loc[m, "nav_prev"]) - df.loc[m, "flow_net"]
+            ) / df.loc[m, "nav_prev"]
+
+            df_test = df[(df["quarter_end"] >= test_start_qe) &
+                         (df["quarter_end"] <= test_end_qe) &
+                         (df["FundID"].isin(used_funds))].copy()
+            df_test = df_test.dropna(subset=["omega_actual"])
+
+            # Projected omega (align to test window + used funds)
+            om = omega_df.copy()
+            om = om[(om["quarter_end"] >= test_start_qe) & (om["quarter_end"] <= test_end_qe)]
+            om = om[om["FundID"].isin(used_funds)]
+            # If multiple sim_id, average omega across sim_id for a mean path
+            if "sim_id" in om.columns:
+                om = (om.groupby(["FundID", "quarter_end"], as_index=False)
+                        .agg({"omega": "mean", "Adj Strategy": "last", "Grade": "last"}))
+
+            # Ensure strategy/grade columns
+            if "Adj Strategy" not in om.columns or "Grade" not in om.columns:
+                om = om.merge(
+                    df_test[["FundID", "quarter_end", "Adj Strategy", "Grade"]],
+                    on=["FundID", "quarter_end"],
+                    how="left"
+                )
+
+            # Overall mean comparison
+            act_mean = float(df_test["omega_actual"].mean()) if len(df_test) else float("nan")
+            proj_mean = float(om["omega"].mean()) if len(om) else float("nan")
+            print("Omega mean (actual):", round(act_mean, 6))
+            print("Omega mean (projected):", round(proj_mean, 6))
+            print("Omega mean diff (proj - actual):", round(proj_mean - act_mean, 6))
+
+            # Strategy/grade comparison (top gaps)
+            act_g = (df_test.groupby(["Adj Strategy", "Grade"])["omega_actual"]
+                     .mean().reset_index().rename(columns={"omega_actual": "omega_actual_mean"}))
+            proj_g = (om.groupby(["Adj Strategy", "Grade"])["omega"]
+                      .mean().reset_index().rename(columns={"omega": "omega_proj_mean"}))
+            comp = act_g.merge(proj_g, on=["Adj Strategy", "Grade"], how="outer")
+            comp["omega_gap"] = comp["omega_proj_mean"] - comp["omega_actual_mean"]
+            comp = comp.sort_values("omega_gap")
+            print("Top omega gaps (proj - actual) by strategy/grade:")
+            print(comp.head(8).to_string(index=False))
+    except Exception as e:
+        print("Omega validation failed:", repr(e))
+    print("=========================")
+
     # Save
     def _yq(qe: pd.Timestamp) -> str:
         return f"{qe.year}_Q{qe.quarter}"
