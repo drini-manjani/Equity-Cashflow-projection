@@ -68,7 +68,10 @@ def main() -> int:
     ap.add_argument("--input", default="data.csv", help="Input data file (.csv or .parquet). Default: data.csv")
     ap.add_argument("--output", default="data_anonymized.csv", help="Output anonymized file (.csv or .parquet)")
     ap.add_argument("--map-out", default="fund_map.csv", help="Fund name mapping output (.csv or .parquet)")
-    args = ap.parse_args()
+    # In notebooks/IDEs, extra args may be injected (e.g., -f). Ignore unknowns.
+    args, unknown = ap.parse_known_args()
+    if unknown:
+        print("Warning: ignoring unknown arguments:", " ".join(unknown))
 
     df = _read_any(args.input)
     # normalize column names for matching
