@@ -1387,6 +1387,13 @@ def find_navstart_file(data_dir: str, year: int, quarter: str) -> str:
 
 def main():
     t0 = time.perf_counter()
+    print("=== Backtest config ===")
+    print("RUN_NAV_LOGIC_INLINE:", RUN_NAV_LOGIC_INLINE)
+    print("NAV_LOGIC_MSCI_MODE:", NAV_LOGIC_MSCI_MODE)
+    print("USE_NAV_PROJECTIONS:", USE_NAV_PROJECTIONS)
+    print("RUN_CONDITIONAL:", RUN_CONDITIONAL, "RUN_UNCONDITIONAL:", RUN_UNCONDITIONAL)
+    print("CALIBRATION_BUCKET_MODE:", CALIBRATION_BUCKET_MODE, "REPORT_BUCKET_MODE:", REPORT_BUCKET_MODE)
+    print("=======================")
     year = int(input("Enter year (e.g. 2025): ").strip())
     quarter = input("Enter quarter (Q1, Q2, Q3, Q4): ").strip().upper()
 
