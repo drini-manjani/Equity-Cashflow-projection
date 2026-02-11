@@ -1,0 +1,26 @@
+[project]
+name = "ecf-model"
+version = "0.1.0"
+description = "Equity cashflow projection engine with robust fitting and calibration"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "pandas>=2.0",
+  "scipy>=1.10",
+  "openpyxl>=3.1",
+]
+
+[project.scripts]
+ecf-fit = "ecf_model.cli:main"
+ecf-project = "ecf_model.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

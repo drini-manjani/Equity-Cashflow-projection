@@ -1,0 +1,8 @@
+{
+  "method": "weighted_lag1_corr_blend",
+  "rho_calibrated": 0.05049474811228342,
+  "rho_event_lag1": 0.07436425968990372,
+  "rho_flow_lag1": 0.014690480745852963,
+  "n_funds_event": 943,
+  "n_funds_flow": 951
+}

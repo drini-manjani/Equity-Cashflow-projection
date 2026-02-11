@@ -1,0 +1,3 @@
+[console_scripts]
+ecf-fit = ecf_model.cli:main
+ecf-project = ecf_model.cli:main

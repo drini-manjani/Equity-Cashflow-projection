@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: ecf-model
+Version: 0.1.0
+Summary: Equity cashflow projection engine with robust fitting and calibration
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24
+Requires-Dist: pandas>=2.0
+Requires-Dist: scipy>=1.10
+Requires-Dist: openpyxl>=3.1
+
+# Equity Cashflow Projection (Overhaul)
+
+This repository contains a reproducible projection pipeline for equity cashflows.
+
+- Historical calibration cutoff: `2025Q3`
+- Supported scenarios: `neutral`, `bullish`, `bearish`
+- Core outputs: fitted artifacts, calibration deltas, simulated portfolio series, fund-level paths.
+
+Run commands:
+
+```bash
+python3 -m ecf_model.cli fit --hist anonymized.csv --msci msci.xlsx --cutoff 2025Q3 --run-tag 2025Q3_v2
+python3 -m ecf_model.cli project --mode test --input model_fits/test_portfolio.csv --calibration runs_v2/2025Q3_v2/calibration --scenario neutral --run-tag test_2025Q3_v2
+```

@@ -1,6 +1,0 @@
-Using single NAV Logic omega path; cashflow sims = 5.
-[omega] train_actual: mean=-0.0151 median=-0.0049 p10=-0.1420 p90=0.1295 n=5454
-[omega] test_actual: mean=-0.2629 median=0.0000 p10=-0.0910 p90=0.1222 n=20490
-[omega] model_input (omega_df): mean=-0.0110 median=-0.0101 p10=-0.2523 p90=0.2322 n=14043
-Warning: hazard model fit failed, falling back to group means: loop of ufunc does not support argument 0 of type float which has no callable exp method
-Running unconditional backtest (simulated MSCI)...
