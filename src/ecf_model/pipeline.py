@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -43,42 +44,54 @@ def _calc_horizon(start_qe: pd.Timestamp, states: dict, min_horizon_q: int) -> i
     return int(max(min_horizon_q, max_end - ord_start + 1 + 8))
 
 
-def _weighted_lag1_corr_by_fund(df: pd.DataFrame, value_col: str, min_obs: int = 6) -> tuple[float, int]:
-    num = 0.0
-    den = 0.0
-    n_funds = 0
-    for _, g in df.groupby("FundID"):
-        v = pd.to_numeric(g[value_col], errors="coerce").to_numpy(dtype=float)
-        v = v[np.isfinite(v)]
-        n = len(v)
-        if n < int(min_obs):
-            continue
-        x = v[:-1]
-        y = v[1:]
-        if len(x) < 2 or float(np.std(x)) <= 1e-12 or float(np.std(y)) <= 1e-12:
-            continue
-        c = float(np.corrcoef(x, y)[0, 1])
-        if not np.isfinite(c):
-            continue
-        w = float(max(n - 1, 1))
-        num += w * c
-        den += w
-        n_funds += 1
-    if den <= 0.0:
+def _weighted_cross_fund_corr(df: pd.DataFrame, value_col: str, min_obs: int = 8) -> tuple[float, int]:
+    cols = ["quarter_end", "FundID", value_col]
+    if any(c not in df.columns for c in cols):
         return math.nan, 0
-    return float(num / den), int(n_funds)
+
+    d = df[cols].copy()
+    d["quarter_end"] = pd.to_datetime(d["quarter_end"], errors="coerce")
+    d[value_col] = pd.to_numeric(d[value_col], errors="coerce")
+    d = d[d["quarter_end"].notna() & np.isfinite(d[value_col])]
+    if d.empty:
+        return math.nan, 0
+
+    piv = d.pivot_table(index="quarter_end", columns="FundID", values=value_col, aggfunc="mean")
+    if piv.shape[1] < 2:
+        return math.nan, 0
+
+    corr = piv.corr(min_periods=int(min_obs))
+    overlap = piv.notna().astype(int).T.dot(piv.notna().astype(int))
+    c = corr.to_numpy(dtype=float)
+    n = c.shape[0]
+    if n < 2:
+        return math.nan, 0
+
+    iu = np.triu_indices(n, k=1)
+    cvals = c[iu]
+    ovals = overlap.to_numpy(dtype=float)[iu]
+    valid = np.isfinite(cvals) & (ovals >= float(min_obs))
+    if not np.any(valid):
+        return math.nan, 0
+
+    w = np.maximum(ovals[valid] - 1.0, 1.0)
+    rho = float(np.average(cvals[valid], weights=w))
+    n_pairs = int(np.sum(valid))
+    return rho, n_pairs
 
 
 def _calibrate_copula_from_history(hist_to_cutoff: pd.DataFrame) -> dict[str, Any]:
     h = hist_to_cutoff.sort_values(["FundID", "quarter_end"]).copy()
     if h.empty:
         return {
-            "method": "weighted_lag1_corr_blend",
+            "method": "weighted_cross_fund_corr_blend",
+            "dependence_scope": "cross_fund_same_quarter",
             "rho_calibrated": 0.35,
-            "rho_event_lag1": math.nan,
-            "rho_flow_lag1": math.nan,
-            "n_funds_event": 0,
-            "n_funds_flow": 0,
+            "rho_event_pair_corr": math.nan,
+            "rho_flow_pair_corr": math.nan,
+            "n_fund_pairs_event": 0,
+            "n_fund_pairs_flow": 0,
+            "min_overlap_quarters": 8,
         }
 
     draw_abs = pd.to_numeric(h["Adj Drawdown EUR"], errors="coerce").abs().fillna(0.0)
@@ -95,8 +108,8 @@ def _calibrate_copula_from_history(hist_to_cutoff: pd.DataFrame) -> dict[str, An
     h["any_event"] = ((draw_abs > 0.0) | (rep_abs > 0.0) | (recall_flow > 0.0)).astype(float)
     h["flow_ratio"] = (draw_abs + rep_abs + recall_flow) / np.maximum(commit, 1.0)
 
-    rho_event, n_event = _weighted_lag1_corr_by_fund(h, "any_event", min_obs=6)
-    rho_flow, n_flow = _weighted_lag1_corr_by_fund(h, "flow_ratio", min_obs=6)
+    rho_event, n_event = _weighted_cross_fund_corr(h, "any_event", min_obs=8)
+    rho_flow, n_flow = _weighted_cross_fund_corr(h, "flow_ratio", min_obs=8)
 
     event_pos = max(float(rho_event), 0.0) if np.isfinite(rho_event) else math.nan
     flow_pos = max(float(rho_flow), 0.0) if np.isfinite(rho_flow) else math.nan
@@ -112,12 +125,14 @@ def _calibrate_copula_from_history(hist_to_cutoff: pd.DataFrame) -> dict[str, An
 
     rho_cal = float(np.clip(rho_raw, 0.05, 0.85))
     return {
-        "method": "weighted_lag1_corr_blend",
+        "method": "weighted_cross_fund_corr_blend",
+        "dependence_scope": "cross_fund_same_quarter",
         "rho_calibrated": rho_cal,
-        "rho_event_lag1": float(rho_event) if np.isfinite(rho_event) else math.nan,
-        "rho_flow_lag1": float(rho_flow) if np.isfinite(rho_flow) else math.nan,
-        "n_funds_event": int(n_event),
-        "n_funds_flow": int(n_flow),
+        "rho_event_pair_corr": float(rho_event) if np.isfinite(rho_event) else math.nan,
+        "rho_flow_pair_corr": float(rho_flow) if np.isfinite(rho_flow) else math.nan,
+        "n_fund_pairs_event": int(n_event),
+        "n_fund_pairs_flow": int(n_flow),
+        "min_overlap_quarters": 8,
     }
 
 
@@ -135,6 +150,29 @@ def _resolve_copula_rho(calibration_dir: Path, cfg: PipelineConfig) -> None:
     if not np.isfinite(rho):
         rho = 0.35
     cfg.simulation.copula_rho = float(np.clip(rho, 0.0, 0.95))
+
+
+def _infer_quarter_namespace(calibration_dir: Path) -> str | None:
+    parts = calibration_dir.resolve().parts
+    for i, part in enumerate(parts):
+        if part != "runs_v2":
+            continue
+        if i + 1 >= len(parts):
+            continue
+        candidate = str(parts[i + 1]).strip()
+        if re.fullmatch(r"\d{4}Q[1-4]", candidate):
+            return candidate
+    return None
+
+
+def _align_run_tag_to_calibration_quarter(calibration_dir: Path, cfg: PipelineConfig) -> None:
+    run_tag = str(cfg.run_tag or "").strip().replace("\\", "/")
+    if not run_tag or "/" in run_tag:
+        return
+    quarter_ns = _infer_quarter_namespace(calibration_dir)
+    if not quarter_ns:
+        return
+    cfg.run_tag = f"{quarter_ns}/{run_tag}"
 
 
 def _xnpv(rate: float, cfs: np.ndarray, dts: np.ndarray) -> float:
@@ -402,6 +440,7 @@ def run_projection_pipeline(
     if not calibration_dir.exists():
         raise FileNotFoundError(calibration_dir)
 
+    _align_run_tag_to_calibration_quarter(calibration_dir, cfg)
     ensure_dir(cfg.run_root)
     ensure_dir(cfg.projection_dir)
 

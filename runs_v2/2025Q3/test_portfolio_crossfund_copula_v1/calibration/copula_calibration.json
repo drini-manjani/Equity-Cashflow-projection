@@ -1,0 +1,10 @@
+{
+  "method": "weighted_cross_fund_corr_blend",
+  "dependence_scope": "cross_fund_same_quarter",
+  "rho_calibrated": 0.05,
+  "rho_event_pair_corr": 0.00673909387313084,
+  "rho_flow_pair_corr": 0.010554333487222125,
+  "n_fund_pairs_event": 397402,
+  "n_fund_pairs_flow": 416568,
+  "min_overlap_quarters": 8
+}

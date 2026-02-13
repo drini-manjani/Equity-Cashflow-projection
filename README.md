@@ -2,6 +2,12 @@
 
 Cross-platform project for private-equity cashflow projection with quarter-based runs.
 
+Detailed model documentation:
+
+- `docs/modeling_methodology.md`
+- `docs/modeling_methodology_deep_dive.md`
+- `docs/modeling_methodology_40p.md`
+
 ## Data Update Flow
 
 1. Run `data.ipynb` (reads SQL from `cashflows.txt`, `fund.txt`, `grades.txt`, `kmp.txt`).

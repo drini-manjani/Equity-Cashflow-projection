@@ -61,7 +61,7 @@ class SimConfig:
     horizon_q: int = 24
     draw_ratio_cap: float = 1.0
     omega_clip: tuple[float, float] = (-0.5, 0.5)
-    # One-factor Gaussian copula dependency within each fund across all cashflow draws.
+    # One-factor Gaussian copula dependency across funds in each quarter/channel.
     copula_enabled: bool = True
     copula_rho: float | None = None
     post_invest_draws_enabled: bool = True

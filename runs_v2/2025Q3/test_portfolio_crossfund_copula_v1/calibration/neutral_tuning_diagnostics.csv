@@ -1,0 +1,2 @@
+irr_target_mode,target_irr,target_tvpi,best_objective,best_pred_irr,best_pred_tvpi,irr_alignment_scale,irr_alignment_pred_irr,irr_alignment_pred_tvpi,target_recall_to_commit,target_recall_to_rep,recall_alignment_scale,target_draw_to_commit_mature,target_draw_n_mature_funds,draw_alignment_scale,irr_post_alignment_scale
+pooled,0.11786621636458394,1.5472279108269171,0.3257446485735023,0.11919297680904417,1.9458499344668236,1.0,0.11605867345933218,1.7664576569676331,0.07327661123783591,0.13941128415570214,0.6,1.039902683049691,395,1.6,1.0

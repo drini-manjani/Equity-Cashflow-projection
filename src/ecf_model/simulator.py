@@ -25,6 +25,7 @@ class SimulationOutputs:
     portfolio_series: pd.DataFrame
     fund_quarterly_mean: pd.DataFrame
     fund_end_summary: pd.DataFrame
+    final_distribution_summary: pd.DataFrame | None = None
 
     def save(self, projection_dir: Path) -> None:
         out = projection_dir / "sim_outputs"
@@ -32,6 +33,8 @@ class SimulationOutputs:
         self.portfolio_series.to_csv(out / "sim_portfolio_series.csv", index=False)
         self.fund_quarterly_mean.to_csv(out / "sim_fund_quarterly_mean.csv", index=False)
         self.fund_end_summary.to_csv(out / "sim_fund_end_summary.csv", index=False)
+        if self.final_distribution_summary is not None and not self.final_distribution_summary.empty:
+            self.final_distribution_summary.to_csv(out / "sim_portfolio_final_distribution.csv", index=False)
 
 
 class _Lookup:
@@ -364,6 +367,50 @@ def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
 
 
+def _xnpv(rate: float, cfs: np.ndarray, dts: np.ndarray) -> float:
+    if len(cfs) == 0:
+        return math.nan
+    t0 = dts[0]
+    years = ((dts - t0) / np.timedelta64(1, "D")) / 365.0
+    base = 1.0 + float(rate)
+    if base <= 0.0:
+        return math.inf
+    disc = np.exp(np.clip(years * np.log(base), -700.0, 700.0))
+    return float(np.sum(cfs / disc))
+
+
+def _xirr(cfs: np.ndarray, dts: np.ndarray) -> float:
+    if len(cfs) < 2:
+        return math.nan
+    if not (np.any(cfs < 0.0) and np.any(cfs > 0.0)):
+        return math.nan
+
+    lo, hi = -0.9999, 10.0
+    f_lo, f_hi = _xnpv(lo, cfs, dts), _xnpv(hi, cfs, dts)
+    k = 0
+    while np.isfinite(f_lo) and np.isfinite(f_hi) and f_lo * f_hi > 0.0 and k < 80:
+        hi *= 2.0
+        f_hi = _xnpv(hi, cfs, dts)
+        k += 1
+    if (not np.isfinite(f_lo)) or (not np.isfinite(f_hi)) or f_lo * f_hi > 0.0:
+        return math.nan
+
+    for _ in range(240):
+        mid = (lo + hi) / 2.0
+        f_mid = _xnpv(mid, cfs, dts)
+        if not np.isfinite(f_mid):
+            return math.nan
+        if abs(f_mid) < 1e-8:
+            return mid
+        if f_lo * f_mid <= 0.0:
+            hi = mid
+            f_hi = f_mid
+        else:
+            lo = mid
+            f_lo = f_mid
+    return (lo + hi) / 2.0
+
+
 def _copula_uniform(rng: np.random.Generator, z_common: float, rho: float) -> float:
     r = float(np.clip(float(rho), 0.0, 0.999))
     if r <= 1e-12:
@@ -493,13 +540,27 @@ def simulate_portfolio(
         recall_bal = recall_bal0.copy()
         age = age0.copy()
         rc_enabled = np.array([rng.random() < float(d.get("rc_propensity", 1.0)) for d in deltas], dtype=bool)
-        # One-factor Gaussian copula latent for each fund in this simulation path.
-        fund_factor = rng.standard_normal(n_funds) if copula_enabled else np.zeros(n_funds, dtype=float)
-
         for t in range(horizon):
             qe_ord = q_ord[t]
             msci_now = float(msci_r[s, t])
             msci_lag = float(msci_r_lag[s, t])
+            # One-factor Gaussian copula common shocks by quarter/channel.
+            # This induces cross-fund dependence in the same quarter while avoiding
+            # hard-coded within-fund persistence across all quarters.
+            if copula_enabled:
+                z_draw_evt_common = float(rng.standard_normal())
+                z_draw_ratio_common = float(rng.standard_normal())
+                z_rep_evt_common = float(rng.standard_normal())
+                z_rep_ratio_common = float(rng.standard_normal())
+                z_rc_evt_common = float(rng.standard_normal())
+                z_rc_ratio_common = float(rng.standard_normal())
+            else:
+                z_draw_evt_common = 0.0
+                z_draw_ratio_common = 0.0
+                z_rep_evt_common = 0.0
+                z_rep_ratio_common = 0.0
+                z_rc_evt_common = 0.0
+                z_rc_ratio_common = 0.0
 
             q_draw = np.zeros(n_funds, dtype=float)
             q_rep = np.zeros(n_funds, dtype=float)
@@ -511,7 +572,6 @@ def simulate_portfolio(
                 grd = str(grade[i])
                 sz = str(size_bucket[i])
                 d = deltas[i]
-                z_common = float(fund_factor[i])
 
                 pre_first_close = first_close_ord[i] > -10**8 and qe_ord < first_close_ord[i]
                 if pre_first_close:
@@ -600,13 +660,13 @@ def simulate_portfolio(
                     draw_allowed = False
 
                 draw_cap = max(commitment0[i] + recall_bal[i] - draw_cum[i], 0.0)
-                u_draw_evt = _copula_uniform(rng, z_common, copula_rho) if copula_enabled else float(rng.random())
+                u_draw_evt = _copula_uniform(rng, z_draw_evt_common, copula_rho) if copula_enabled else float(rng.random())
                 draw_event = draw_allowed and (draw_cap > 1.0) and (u_draw_evt < p_draw)
 
                 draw_amt = 0.0
                 if draw_event:
                     rfit = lookup.ratio("draw_ratio", strat, grd, age_bucket_draw, sz)
-                    u_draw_ratio = _copula_uniform(rng, z_common, copula_rho) if copula_enabled else None
+                    u_draw_ratio = _copula_uniform(rng, z_draw_ratio_common, copula_rho) if copula_enabled else None
                     r = _sample_ratio(rng, rfit, u=u_draw_ratio) * float(d["delta_draw_ratio_scale"]) * float(draw_r_mult_phase)
                     r *= draw_ratio_life_mult
                     r = float(max(r, 0.0))
@@ -618,12 +678,12 @@ def simulate_portfolio(
                     from_recall = max(draw_amt - commit_remaining, 0.0)
                     recall_bal[i] = max(recall_bal[i] - from_recall, 0.0)
 
-                u_rep_evt = _copula_uniform(rng, z_common, copula_rho) if copula_enabled else float(rng.random())
+                u_rep_evt = _copula_uniform(rng, z_rep_evt_common, copula_rho) if copula_enabled else float(rng.random())
                 rep_event = (nav[i] > fit_cfg.nav_gate) and (u_rep_evt < p_rep)
                 rep_amt = 0.0
                 if rep_event:
                     rfit = lookup.ratio("rep_ratio", strat, grd, age_bucket_rep, sz)
-                    u_rep_ratio = _copula_uniform(rng, z_common, copula_rho) if copula_enabled else None
+                    u_rep_ratio = _copula_uniform(rng, z_rep_ratio_common, copula_rho) if copula_enabled else None
                     rr = _sample_ratio(rng, rfit, u=u_rep_ratio) * float(d["delta_rep_ratio_scale"])
                     rr *= rep_ratio_life_mult
                     rr *= float(rep_rr_mult_phase)
@@ -635,10 +695,10 @@ def simulate_portfolio(
                     rep_amt = min(rr * nav[i], nav[i] + draw_amt)
 
                 rc_amt = 0.0
-                u_rc_evt = _copula_uniform(rng, z_common, copula_rho) if copula_enabled else float(rng.random())
+                u_rc_evt = _copula_uniform(rng, z_rc_evt_common, copula_rho) if copula_enabled else float(rng.random())
                 if rep_amt > 0 and (u_rc_evt < p_rc_cond):
                     rfit_rc = lookup.ratio("rc_ratio_given_rep", strat, grd, age_bucket_rep, sz)
-                    u_rc_ratio = _copula_uniform(rng, z_common, copula_rho) if copula_enabled else None
+                    u_rc_ratio = _copula_uniform(rng, z_rc_ratio_common, copula_rho) if copula_enabled else None
                     rc_ratio = max(_sample_ratio(rng, rfit_rc, u=u_rc_ratio), 0.0) * float(d.get("delta_rc_ratio_scale", 1.0))
                     rc_amt = rep_amt * rc_ratio
 
@@ -744,18 +804,26 @@ def simulate_portfolio(
             "sim_rep_mean": p_rep_sims.mean(axis=0),
             "sim_nav_mean": p_nav_sims.mean(axis=0),
             "sim_rc_mean": p_rc_sims.mean(axis=0),
+            "sim_draw_p05": np.quantile(p_draw_sims, 0.05, axis=0),
             "sim_draw_p10": np.quantile(p_draw_sims, 0.10, axis=0),
             "sim_draw_p50": np.quantile(p_draw_sims, 0.50, axis=0),
             "sim_draw_p90": np.quantile(p_draw_sims, 0.90, axis=0),
+            "sim_draw_p95": np.quantile(p_draw_sims, 0.95, axis=0),
+            "sim_rep_p05": np.quantile(p_rep_sims, 0.05, axis=0),
             "sim_rep_p10": np.quantile(p_rep_sims, 0.10, axis=0),
             "sim_rep_p50": np.quantile(p_rep_sims, 0.50, axis=0),
             "sim_rep_p90": np.quantile(p_rep_sims, 0.90, axis=0),
+            "sim_rep_p95": np.quantile(p_rep_sims, 0.95, axis=0),
+            "sim_nav_p05": np.quantile(p_nav_sims, 0.05, axis=0),
             "sim_nav_p10": np.quantile(p_nav_sims, 0.10, axis=0),
             "sim_nav_p50": np.quantile(p_nav_sims, 0.50, axis=0),
             "sim_nav_p90": np.quantile(p_nav_sims, 0.90, axis=0),
+            "sim_nav_p95": np.quantile(p_nav_sims, 0.95, axis=0),
+            "sim_rc_p05": np.quantile(p_rc_sims, 0.05, axis=0),
             "sim_rc_p10": np.quantile(p_rc_sims, 0.10, axis=0),
             "sim_rc_p50": np.quantile(p_rc_sims, 0.50, axis=0),
             "sim_rc_p90": np.quantile(p_rc_sims, 0.90, axis=0),
+            "sim_rc_p95": np.quantile(p_rc_sims, 0.95, axis=0),
             "sim_dpi_p05": _path_quantile(dpi_sims, 0.05),
             "sim_dpi_p50": _path_quantile(dpi_sims, 0.50),
             "sim_dpi_p95": _path_quantile(dpi_sims, 0.95),
@@ -783,8 +851,82 @@ def simulate_portfolio(
         ]
     )
     end = end.rename(columns={"quarter_end": "projection_end_qe", "sim_nav_mean": "sim_nav_end_mean"})
+    final_draw = cum_draw_sims[:, -1] if cum_draw_sims.shape[1] else np.array([], dtype=float)
+    final_rep = cum_rep_sims[:, -1] if cum_rep_sims.shape[1] else np.array([], dtype=float)
+    final_nav = p_nav_sims[:, -1] if p_nav_sims.shape[1] else np.array([], dtype=float)
+    final_dpi = np.where(final_draw > 1e-12, final_rep / final_draw, np.nan)
+    final_tvpi = np.where(final_draw > 1e-12, (final_rep + final_nav) / final_draw, np.nan)
 
-    return SimulationOutputs(portfolio_series=port, fund_quarterly_mean=fund_q, fund_end_summary=end)
+    irr_paths = np.full(n_sims, np.nan, dtype=float)
+    if horizon > 0:
+        cfs_q = p_rep_sims - p_draw_sims
+        dts = np.array(quarters, dtype="datetime64[ns]")
+        for s in range(n_sims):
+            cfs = np.append(cfs_q[s, :], float(final_nav[s]))
+            dts_s = np.append(dts, dts[-1])
+            irr = _xirr(cfs, dts_s)
+            if np.isfinite(irr) and (-0.95 <= irr <= 2.0):
+                irr_paths[s] = float(irr)
+
+    def _q(x: np.ndarray, q: float) -> float:
+        v = x[np.isfinite(x)]
+        if len(v) == 0:
+            return math.nan
+        return float(np.quantile(v, q))
+
+    final_dist = pd.DataFrame(
+        [
+            {
+                "quarter_end": pd.Timestamp(quarters[-1]) if len(quarters) else pd.NaT,
+                "metric": "cum_draw",
+                "p05": _q(final_draw, 0.05),
+                "p50": _q(final_draw, 0.50),
+                "p95": _q(final_draw, 0.95),
+            },
+            {
+                "quarter_end": pd.Timestamp(quarters[-1]) if len(quarters) else pd.NaT,
+                "metric": "cum_repay",
+                "p05": _q(final_rep, 0.05),
+                "p50": _q(final_rep, 0.50),
+                "p95": _q(final_rep, 0.95),
+            },
+            {
+                "quarter_end": pd.Timestamp(quarters[-1]) if len(quarters) else pd.NaT,
+                "metric": "end_nav",
+                "p05": _q(final_nav, 0.05),
+                "p50": _q(final_nav, 0.50),
+                "p95": _q(final_nav, 0.95),
+            },
+            {
+                "quarter_end": pd.Timestamp(quarters[-1]) if len(quarters) else pd.NaT,
+                "metric": "dpi",
+                "p05": _q(final_dpi, 0.05),
+                "p50": _q(final_dpi, 0.50),
+                "p95": _q(final_dpi, 0.95),
+            },
+            {
+                "quarter_end": pd.Timestamp(quarters[-1]) if len(quarters) else pd.NaT,
+                "metric": "tvpi",
+                "p05": _q(final_tvpi, 0.05),
+                "p50": _q(final_tvpi, 0.50),
+                "p95": _q(final_tvpi, 0.95),
+            },
+            {
+                "quarter_end": pd.Timestamp(quarters[-1]) if len(quarters) else pd.NaT,
+                "metric": "irr",
+                "p05": _q(irr_paths, 0.05),
+                "p50": _q(irr_paths, 0.50),
+                "p95": _q(irr_paths, 0.95),
+            },
+        ]
+    )
+
+    return SimulationOutputs(
+        portfolio_series=port,
+        fund_quarterly_mean=fund_q,
+        fund_end_summary=end,
+        final_distribution_summary=final_dist,
+    )
 
 
 __all__ = ["SimulationOutputs", "simulate_portfolio"]
