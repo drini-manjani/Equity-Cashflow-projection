@@ -46,7 +46,7 @@ It also auto-converts those portfolio templates into canonical model input CSVs.
 python scripts/run_quarter_pipeline.py --cutoff 2025Q3
 ```
 
-By default, simulations use a one-factor Gaussian copula within each fund across drawdowns, repayments, and recallables. If `--copula-rho` is not provided, rho is calibrated from historical data during `fit` and loaded from `calibration/copula_calibration.json`. You can override it, for example:
+By default, simulations use a one-factor Gaussian copula with cross-fund same-quarter dependence across drawdowns, repayments, and recallables. If `--copula-rho` is not provided, rho is calibrated from historical data during `fit` and loaded from `calibration/copula_calibration.json`. You can override it, for example:
 
 ```bash
 python scripts/run_quarter_pipeline.py --cutoff 2025Q3 --copula-rho 0.45
@@ -63,6 +63,9 @@ Key files in each projection run:
 
 - `projection/portfolio_observation_summary.csv`
 - `projection/sim_outputs/sim_portfolio_series.csv`
+- `projection/sim_outputs/sim_portfolio_final_distribution.csv`
+- `projection/sim_outputs/sim_portfolio_dpi_scenarios.csv` (coherent path scenarios tied to final DPI p05/p10/p50/p90/p95)
+- `projection/sim_outputs/sim_portfolio_dpi_scenario_summary.csv`
 - `projection/sim_outputs/sim_fund_quarterly_mean.csv`
 - `projection/sim_outputs/sim_fund_end_summary.csv`
 - `calibration/` (fitted+tuned artifacts used for the run)

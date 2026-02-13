@@ -1,0 +1,125 @@
+{
+  "cutoff_quarter": "2025Q3",
+  "run_tag": "2025Q3/test_portfolio_Sentral_dpi_link_smoke",
+  "scenario": "neutral",
+  "fit": {
+    "min_obs_group": 40,
+    "prior_strength": 60.0,
+    "ratio_winsor_lower_q": 0.01,
+    "ratio_winsor_upper_q": 0.99,
+    "nav_gate": 1.0,
+    "omega_fit_clip": [
+      -0.5,
+      0.5
+    ],
+    "size_bins": [
+      -Infinity,
+      200000000.0,
+      Infinity
+    ],
+    "size_labels": [
+      "<200m",
+      ">=200m"
+    ]
+  },
+  "calibration": {
+    "holdout_quarters": 8,
+    "min_obs_for_adjustment": 250,
+    "significance_alpha": 0.1,
+    "shrink_n": 800.0,
+    "apply_stability_attenuation": true,
+    "stability_step_q": 2,
+    "stability_min_points": 8,
+    "p_rep_mult_clip": [
+      0.8,
+      1.08
+    ],
+    "p_draw_mult_clip": [
+      0.85,
+      1.2
+    ],
+    "rep_ratio_scale_clip": [
+      0.7,
+      1.6
+    ],
+    "draw_ratio_scale_clip": [
+      0.7,
+      1.4
+    ],
+    "omega_bump_clip": [
+      -0.02,
+      0.06
+    ],
+    "post_invest_draw_prob_clip": [
+      0.05,
+      1.0
+    ],
+    "post_invest_draw_ratio_clip": [
+      0.05,
+      1.0
+    ],
+    "pre_end_repay_min_obs": 40,
+    "pre_end_repay_prob_clip": [
+      0.6,
+      1.0
+    ],
+    "pre_end_repay_ratio_clip": [
+      0.6,
+      1.0
+    ],
+    "lifecycle_min_obs": 30,
+    "lifecycle_p_mult_clip": [
+      0.6,
+      1.6
+    ],
+    "lifecycle_ratio_mult_clip": [
+      0.5,
+      2.0
+    ],
+    "lifecycle_draw_p_mult_clip": [
+      0.5,
+      1.5
+    ],
+    "lifecycle_draw_ratio_mult_clip": [
+      0.5,
+      1.5
+    ],
+    "lifecycle_omega_bump_clip": [
+      -0.08,
+      0.08
+    ],
+    "lifecycle_nav_floor_clip": [
+      0.0,
+      1.5
+    ],
+    "lifecycle_nav_floor_quantile": 0.5
+  },
+  "simulation": {
+    "n_sims": 10,
+    "seed": 2026,
+    "horizon_q": 8,
+    "draw_ratio_cap": 1.0,
+    "omega_clip": [
+      -0.5,
+      0.5
+    ],
+    "copula_enabled": true,
+    "copula_rho": 0.05,
+    "post_invest_draws_enabled": true,
+    "pre_end_repay_enabled": true,
+    "post_end_runoff_enabled": true,
+    "post_end_no_draws": true,
+    "lifecycle_rep_strength": 0.5,
+    "lifecycle_draw_strength": 0.5,
+    "lifecycle_omega_strength": 0.35,
+    "lifecycle_nav_floor_strength": 0.45,
+    "lifecycle_nav_floor_strength_mid": 0.25,
+    "lifecycle_nav_floor_min_start_age_q": 8
+  },
+  "scenarios": {
+    "neutral_drift_shift_q": 0.0,
+    "bullish_drift_shift_q": 0.0075,
+    "bearish_drift_shift_q": -0.0075,
+    "volatility_scale": 1.0
+  }
+}

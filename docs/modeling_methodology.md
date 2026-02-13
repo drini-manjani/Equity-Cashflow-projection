@@ -18,7 +18,7 @@ The model combines:
 - Hierarchical empirical fitting (strategy, grade, age, size buckets)
 - Holdout-based recalibration and shrinkage
 - Lifecycle/end-of-life behavior controls
-- One-factor Gaussian copula dependence within each fund
+- One-factor Gaussian copula dependence across funds within each quarter
 - Scenario-based MSCI path generation (neutral, bullish, bearish)
 
 ## 2. Data Contract and Canonicalization
@@ -352,7 +352,13 @@ Residual NAV floor logic near/after end-of-life:
 Saved in `projection/sim_outputs/`:
 
 - `sim_portfolio_series.csv`
-  - Mean and quantiles by quarter (`draw`, `rep`, `nav`, `recall`, DPI p05/p50/p95)
+  - Mean and marginal quantiles by quarter (`draw`, `rep`, `nav`, `recall`, DPI p05/p50/p95)
+- `sim_portfolio_final_distribution.csv`
+  - Final-quarter pathwise distribution (`cum_draw`, `cum_repay`, `end_nav`, `dpi`, `tvpi`, `irr`) at p05/p50/p95
+- `sim_portfolio_dpi_scenarios.csv`
+  - Coherent scenario paths selected by final DPI quantiles (`dpi_p05`, `dpi_p10`, `dpi_p50`, `dpi_p90`, `dpi_p95`)
+- `sim_portfolio_dpi_scenario_summary.csv`
+  - Final metrics for each selected DPI scenario path
 - `sim_fund_quarterly_mean.csv`
   - Fund-by-quarter means
 - `sim_fund_end_summary.csv`
@@ -365,7 +371,7 @@ Also:
 - `projection/portfolio_observation_summary.csv` with cumulative metrics, DPI/RVPI/TVPI, rolling IRR
 - `projection/projection_run_config.json`
 
-Note: full per-path fund cashflow trajectories are not currently persisted (only aggregated cashflow outputs; MSCI full paths are saved).
+Note: `sim_portfolio_series.csv` quantiles are marginal by quarter (not a single coherent path). Use `sim_portfolio_dpi_scenarios.csv` when you need one internally consistent downside/base/upside path tied to DPI percentiles.
 
 ## 7. Scenario Mechanics
 

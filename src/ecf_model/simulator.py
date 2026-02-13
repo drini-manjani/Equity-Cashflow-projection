@@ -26,6 +26,8 @@ class SimulationOutputs:
     fund_quarterly_mean: pd.DataFrame
     fund_end_summary: pd.DataFrame
     final_distribution_summary: pd.DataFrame | None = None
+    dpi_scenario_series: pd.DataFrame | None = None
+    dpi_scenario_summary: pd.DataFrame | None = None
 
     def save(self, projection_dir: Path) -> None:
         out = projection_dir / "sim_outputs"
@@ -35,6 +37,10 @@ class SimulationOutputs:
         self.fund_end_summary.to_csv(out / "sim_fund_end_summary.csv", index=False)
         if self.final_distribution_summary is not None and not self.final_distribution_summary.empty:
             self.final_distribution_summary.to_csv(out / "sim_portfolio_final_distribution.csv", index=False)
+        if self.dpi_scenario_series is not None and not self.dpi_scenario_series.empty:
+            self.dpi_scenario_series.to_csv(out / "sim_portfolio_dpi_scenarios.csv", index=False)
+        if self.dpi_scenario_summary is not None and not self.dpi_scenario_summary.empty:
+            self.dpi_scenario_summary.to_csv(out / "sim_portfolio_dpi_scenario_summary.csv", index=False)
 
 
 class _Lookup:
@@ -921,11 +927,89 @@ def simulate_portfolio(
         ]
     )
 
+    dpi_qs = [0.05, 0.10, 0.50, 0.90, 0.95]
+    dts = np.array(quarters, dtype="datetime64[ns]") if horizon > 0 else np.array([], dtype="datetime64[ns]")
+    dpi_scenario_rows: list[dict[str, Any]] = []
+    dpi_scenario_summary_rows: list[dict[str, Any]] = []
+    finite_idx = np.where(np.isfinite(final_dpi))[0]
+    finite_dpi = final_dpi[finite_idx] if len(finite_idx) else np.array([], dtype=float)
+
+    if len(finite_idx):
+        for q in dpi_qs:
+            label = f"dpi_p{int(round(q * 100)):02d}"
+            q_target = float(np.quantile(finite_dpi, q))
+            local_i = int(np.argmin(np.abs(finite_dpi - q_target)))
+            s_idx = int(finite_idx[local_i])
+            sim_id = s_idx + 1
+
+            draw_path = p_draw_sims[s_idx, :]
+            rep_path = p_rep_sims[s_idx, :]
+            nav_path = p_nav_sims[s_idx, :]
+            rc_path = p_rc_sims[s_idx, :]
+
+            cum_draw = np.cumsum(draw_path)
+            cum_rep = np.cumsum(rep_path)
+            cum_rc = np.cumsum(rc_path)
+            dpi_path = np.full(horizon, np.nan, dtype=float)
+            tvpi_path = np.full(horizon, np.nan, dtype=float)
+            np.divide(cum_rep, cum_draw, out=dpi_path, where=cum_draw > 1e-12)
+            np.divide(cum_rep + nav_path, cum_draw, out=tvpi_path, where=cum_draw > 1e-12)
+
+            irr_path = np.full(horizon, np.nan, dtype=float)
+            cf_q = rep_path - draw_path
+            for t in range(horizon):
+                cfs_t = np.append(cf_q[: t + 1], float(nav_path[t]))
+                dts_t = np.append(dts[: t + 1], dts[t])
+                irr_t = _xirr(cfs_t, dts_t)
+                if np.isfinite(irr_t) and (-0.95 <= irr_t <= 2.0):
+                    irr_path[t] = float(irr_t)
+
+            for t, qe in enumerate(quarters):
+                dpi_scenario_rows.append(
+                    {
+                        "scenario_label": label,
+                        "target_quantile": float(q),
+                        "selected_sim_id": int(sim_id),
+                        "quarter_end": pd.Timestamp(qe),
+                        "draw_q": float(draw_path[t]),
+                        "rep_q": float(rep_path[t]),
+                        "recall_q": float(rc_path[t]),
+                        "nav": float(nav_path[t]),
+                        "cum_draw": float(cum_draw[t]),
+                        "cum_repay": float(cum_rep[t]),
+                        "cum_recall": float(cum_rc[t]),
+                        "dpi_to_date": float(dpi_path[t]) if np.isfinite(dpi_path[t]) else math.nan,
+                        "tvpi_to_date": float(tvpi_path[t]) if np.isfinite(tvpi_path[t]) else math.nan,
+                        "irr_to_date": float(irr_path[t]) if np.isfinite(irr_path[t]) else math.nan,
+                        "is_final": bool(t == (horizon - 1)),
+                    }
+                )
+
+            dpi_scenario_summary_rows.append(
+                {
+                    "scenario_label": label,
+                    "target_quantile": float(q),
+                    "target_dpi": float(q_target),
+                    "selected_sim_id": int(sim_id),
+                    "final_cum_draw": float(cum_draw[-1]) if horizon else math.nan,
+                    "final_cum_repay": float(cum_rep[-1]) if horizon else math.nan,
+                    "final_end_nav": float(nav_path[-1]) if horizon else math.nan,
+                    "final_dpi": float(final_dpi[s_idx]) if np.isfinite(final_dpi[s_idx]) else math.nan,
+                    "final_tvpi": float(final_tvpi[s_idx]) if np.isfinite(final_tvpi[s_idx]) else math.nan,
+                    "final_irr": float(irr_paths[s_idx]) if np.isfinite(irr_paths[s_idx]) else math.nan,
+                }
+            )
+
+    dpi_scenario_df = pd.DataFrame(dpi_scenario_rows)
+    dpi_scenario_summary_df = pd.DataFrame(dpi_scenario_summary_rows)
+
     return SimulationOutputs(
         portfolio_series=port,
         fund_quarterly_mean=fund_q,
         fund_end_summary=end,
         final_distribution_summary=final_dist,
+        dpi_scenario_series=dpi_scenario_df,
+        dpi_scenario_summary=dpi_scenario_summary_df,
     )
 
 
